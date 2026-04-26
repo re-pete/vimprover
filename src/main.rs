@@ -27,6 +27,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -244,6 +245,8 @@ async fn run_single_file(
     // 8. Execute.
     println!();
     println!("Running ffmpeg…");
+    let input_size = std::fs::metadata(input).ok().map(|m| m.len());
+    let started = Instant::now();
     execute::run_recipe(
         &[input],
         std::slice::from_ref(&profile.container),
@@ -253,8 +256,13 @@ async fn run_single_file(
     )
     .await
     .with_context(|| format!("encoding to {}", output.display()))?;
+    let elapsed = started.elapsed();
+    let output_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
 
-    println!("Done. Wrote {}.", output.display());
+    println!(
+        "{}",
+        format::render_completion_summary(&output, input_size, output_size, elapsed)
+    );
     Ok(())
 }
 
@@ -332,6 +340,8 @@ async fn run_concat(
     println!();
     println!("Running ffmpeg…");
     let containers: Vec<_> = profiles.iter().map(|p| p.container.clone()).collect();
+    let total_input_size = sum_input_sizes(inputs);
+    let started = Instant::now();
     execute::run_recipe(
         &input_refs,
         &containers,
@@ -341,9 +351,31 @@ async fn run_concat(
     )
     .await
     .with_context(|| format!("encoding to {}", output.display()))?;
+    let elapsed = started.elapsed();
+    let output_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
 
-    println!("Done. Wrote {}.", output.display());
+    println!(
+        "{}",
+        format::render_concat_completion_summary(
+            &output,
+            inputs.len(),
+            total_input_size,
+            output_size,
+            elapsed,
+        )
+    );
     Ok(())
+}
+
+/// Sum the on-disk sizes of all inputs. Returns `None` if any single stat
+/// fails (rather than reporting a misleading partial total).
+fn sum_input_sizes(inputs: &[PathBuf]) -> Option<u64> {
+    let mut total: u64 = 0;
+    for p in inputs {
+        let size = std::fs::metadata(p).ok()?.len();
+        total = total.checked_add(size)?;
+    }
+    Some(total)
 }
 
 /// Show a `[Y/n]` prompt and return whether the user accepted.

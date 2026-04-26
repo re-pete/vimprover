@@ -337,6 +337,91 @@ pub fn format_duration(secs: f64) -> String {
     }
 }
 
+/// Render the post-encode "Done." summary line for a single-input run.
+///
+/// Includes input → output sizes, the percent change (with direction), and
+/// the wall-clock encode duration. When `input_size_bytes` is `None` (e.g.
+/// stat() failed), the size comparison is omitted gracefully.
+///
+/// Examples:
+///
+/// ```text
+/// Done. Wrote out.mkv (847 MiB → 312 MiB, 63% smaller, 8m12s).
+/// Done. Wrote out.mkv (4.0 GiB → 4.0 GiB, no size change, 47s).
+/// Done. Wrote out.mkv (1.0 GiB → 1.1 GiB, 9% larger, 1h12m04s).
+/// Done. Wrote out.mkv (312 MiB, 8m12s).               # input size unknown
+/// ```
+pub fn render_completion_summary(
+    output_path: &std::path::Path,
+    input_size_bytes: Option<u64>,
+    output_size_bytes: u64,
+    elapsed: std::time::Duration,
+) -> String {
+    let elapsed_str = format_duration(elapsed.as_secs_f64());
+    let out_str = format_bytes(output_size_bytes);
+    match input_size_bytes {
+        Some(in_bytes) if in_bytes > 0 => {
+            let in_str = format_bytes(in_bytes);
+            let pct = render_size_delta_pct(in_bytes, output_size_bytes);
+            format!(
+                "Done. Wrote {} ({in_str} → {out_str}, {pct}, {elapsed_str}).",
+                output_path.display(),
+            )
+        }
+        _ => format!(
+            "Done. Wrote {} ({out_str}, {elapsed_str}).",
+            output_path.display(),
+        ),
+    }
+}
+
+/// Render the post-encode "Done." summary line for a multi-input concat run.
+/// Reports the number of joined inputs alongside the total-size comparison.
+///
+/// Example:
+///
+/// ```text
+/// Done. Wrote joined.mkv (4 inputs, 1.2 GiB → 1.2 GiB, no size change, 12s).
+/// ```
+pub fn render_concat_completion_summary(
+    output_path: &std::path::Path,
+    n_inputs: usize,
+    total_input_size_bytes: Option<u64>,
+    output_size_bytes: u64,
+    elapsed: std::time::Duration,
+) -> String {
+    let elapsed_str = format_duration(elapsed.as_secs_f64());
+    let out_str = format_bytes(output_size_bytes);
+    match total_input_size_bytes {
+        Some(in_bytes) if in_bytes > 0 => {
+            let in_str = format_bytes(in_bytes);
+            let pct = render_size_delta_pct(in_bytes, output_size_bytes);
+            format!(
+                "Done. Wrote {} ({n_inputs} inputs, {in_str} → {out_str}, {pct}, {elapsed_str}).",
+                output_path.display(),
+            )
+        }
+        _ => format!(
+            "Done. Wrote {} ({n_inputs} inputs, {out_str}, {elapsed_str}).",
+            output_path.display(),
+        ),
+    }
+}
+
+/// Format the percent-size delta as `"N% smaller"` / `"N% larger"` /
+/// `"no size change"` (when within ±0.5%).
+fn render_size_delta_pct(input_bytes: u64, output_bytes: u64) -> String {
+    let delta = output_bytes as f64 - input_bytes as f64;
+    let pct = delta / input_bytes as f64 * 100.0;
+    if pct.abs() < 0.5 {
+        "no size change".to_string()
+    } else if pct < 0.0 {
+        format!("{:.0}% smaller", pct.abs())
+    } else {
+        format!("{:.0}% larger", pct.abs())
+    }
+}
+
 /// Format an audio sample rate (Hz) in kHz, preserving fractional rates like 44.1.
 pub fn format_khz(hz: u32) -> String {
     if hz % 1000 == 0 {
@@ -404,6 +489,69 @@ mod tests {
         assert_eq!(format_bitrate(500), "500 bps");
         assert_eq!(format_bitrate(192_000), "192 kbps");
         assert_eq!(format_bitrate(6_534_220), "6.5 Mbps");
+    }
+
+    #[test]
+    fn renders_completion_summary_smaller() {
+        // 847 MiB → 312 MiB ≈ 63% reduction.
+        let s = render_completion_summary(
+            Path::new("out.mkv"),
+            Some(847 * 1024 * 1024),
+            312 * 1024 * 1024,
+            std::time::Duration::from_secs(8 * 60 + 12),
+        );
+        assert_eq!(s, "Done. Wrote out.mkv (847.0 MiB → 312.0 MiB, 63% smaller, 8m12s).");
+    }
+
+    #[test]
+    fn renders_completion_summary_larger() {
+        let s = render_completion_summary(
+            Path::new("out.mkv"),
+            Some(1_000_000_000),
+            1_100_000_000,
+            std::time::Duration::from_secs(72 * 60 + 4),
+        );
+        assert!(s.contains("10% larger"), "got: {s}");
+        assert!(s.contains("1h12m04s"), "got: {s}");
+    }
+
+    #[test]
+    fn renders_completion_summary_no_change() {
+        // Sub-0.5% delta should render as "no size change".
+        let s = render_completion_summary(
+            Path::new("out.mkv"),
+            Some(1_000_000_000),
+            1_001_000_000,
+            std::time::Duration::from_secs(47),
+        );
+        assert!(s.contains("no size change"), "got: {s}");
+        assert!(s.contains("47s"), "got: {s}");
+    }
+
+    #[test]
+    fn renders_completion_summary_unknown_input_size() {
+        let s = render_completion_summary(
+            Path::new("out.mkv"),
+            None,
+            312 * 1024 * 1024,
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(s, "Done. Wrote out.mkv (312.0 MiB, 1m00s).");
+    }
+
+    #[test]
+    fn renders_concat_completion_summary() {
+        let s = render_concat_completion_summary(
+            Path::new("joined.mkv"),
+            4,
+            Some(1_200_000_000),
+            1_201_000_000,
+            std::time::Duration::from_secs(12),
+        );
+        // "no size change" because <0.5% delta.
+        assert!(s.contains("4 inputs"), "got: {s}");
+        assert!(s.contains("no size change"), "got: {s}");
+        assert!(s.contains("12s"), "got: {s}");
     }
 
     #[test]

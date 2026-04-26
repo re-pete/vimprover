@@ -976,3 +976,146 @@ fn concat_refuses_mismatched_resolution_with_actionable_error() {
         "no output should be written when refusing concat"
     );
 }
+
+/// Step-7 atomic-output: after a successful run the partial file is renamed
+/// away, so only the final output exists at the user-visible path. No
+/// `.partial.mkv` litter behind.
+#[test]
+fn successful_run_leaves_only_the_final_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("source.mp4");
+    let output_stem = dir.path().join("renamed");
+    let final_output = dir.path().join("renamed.mkv");
+    let partial_output = dir.path().join("renamed.partial.mkv");
+
+    assert!(
+        synthesize_uniform_480p_mp4(&input, 440),
+        "synthesize source failed"
+    );
+
+    let result = Command::new(vimprover_bin())
+        .arg("--yes")
+        .arg("--force") // synthesized 480p MP4 is "fine"; force to exercise the encode path
+        .arg(&input)
+        .arg(&output_stem)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(final_output.exists(), "final output should exist");
+    assert!(
+        !partial_output.exists(),
+        "partial sibling should NOT exist after success: {}",
+        partial_output.display()
+    );
+}
+
+/// Step-7 atomic-output: a stale `.partial.mkv` from a prior failed run
+/// must be refused (rather than silently clobbered) when `--overwrite`
+/// isn't passed. The error names the partial path so the user knows what
+/// to remove.
+#[test]
+fn refuses_stale_partial_without_overwrite() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("source.mp4");
+    let output_stem = dir.path().join("target");
+    let stale_partial = dir.path().join("target.partial.mkv");
+
+    assert!(synthesize_uniform_480p_mp4(&input, 440));
+
+    // Pre-seed a stale partial. Bytes don't matter — vimprover refuses on
+    // existence alone.
+    std::fs::write(&stale_partial, b"stale partial garbage").expect("seed partial");
+
+    let result = Command::new(vimprover_bin())
+        .arg("--yes")
+        .arg("--force")
+        .arg(&input)
+        .arg(&output_stem)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        !result.status.success(),
+        "vimprover should refuse: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("partial output from a prior run exists"),
+        "expected partial-exists message:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("target.partial.mkv"),
+        "stderr should name the partial:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--overwrite"),
+        "stderr should hint at --overwrite:\n{stderr}"
+    );
+
+    // The stale partial should still be there, untouched.
+    assert!(stale_partial.exists());
+    let content = std::fs::read(&stale_partial).expect("read partial");
+    assert_eq!(content, b"stale partial garbage", "partial must be untouched");
+
+    // No final output written.
+    assert!(!dir.path().join("target.mkv").exists());
+}
+
+/// Step-7 atomic-output: `--overwrite` removes a stale partial and
+/// proceeds to a successful encode.
+#[test]
+fn overwrite_clears_stale_partial_and_succeeds() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("source.mp4");
+    let output_stem = dir.path().join("out");
+    let stale_partial = dir.path().join("out.partial.mkv");
+    let final_output = dir.path().join("out.mkv");
+
+    assert!(synthesize_uniform_480p_mp4(&input, 440));
+    std::fs::write(&stale_partial, b"stale").expect("seed partial");
+
+    let result = Command::new(vimprover_bin())
+        .arg("--yes")
+        .arg("--force")
+        .arg("--overwrite")
+        .arg(&input)
+        .arg(&output_stem)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(final_output.exists());
+    assert!(
+        !stale_partial.exists(),
+        "stale partial should have been replaced"
+    );
+}

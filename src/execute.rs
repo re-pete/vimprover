@@ -273,6 +273,14 @@ fn push_shell_escaped(out: &mut String, s: &str) {
 /// ffmpeg's progress and errors live; on non-zero exit returns
 /// [`Error::FfmpegFailed`].
 ///
+/// **Atomic output.** ffmpeg writes to a `<output-stem>.partial.<ext>`
+/// sibling of the requested `output`. On success we [`std::fs::rename`] it
+/// into place (atomic on the same filesystem). On failure the partial is
+/// left behind so the user can inspect it; the next run with the same
+/// arguments will refuse it (or replace it with `--overwrite`). This means
+/// users never see a half-written file at the real output path, even if
+/// ffmpeg crashes or is Ctrl-C'd halfway through.
+///
 /// When `recipe.concat == Some(Demuxer)`, writes a temp list file for the
 /// concat demuxer (auto-deleted when ffmpeg exits — success or failure)
 /// before spawning.
@@ -285,6 +293,18 @@ pub async fn run_recipe(
 ) -> Result<()> {
     if !overwrite && output.exists() {
         return Err(Error::OutputExists(output.to_path_buf()));
+    }
+
+    // Compute the partial-output sibling path. ffmpeg writes here; we
+    // rename to `output` on success.
+    let partial = partial_sibling(output);
+    if !overwrite && partial.exists() {
+        return Err(Error::PartialOutputExists(partial));
+    }
+    if overwrite {
+        // Clean up any stale partial so ffmpeg's own `-y` overwrite check
+        // doesn't matter (we're using a fresh path either way).
+        let _ = std::fs::remove_file(&partial);
     }
 
     // Keep the list-file handle alive for the duration of the ffmpeg run; it
@@ -300,7 +320,7 @@ pub async fn run_recipe(
     let args = build_ffmpeg_args(
         inputs,
         source_containers,
-        output,
+        &partial,
         recipe,
         overwrite,
         list_path,
@@ -318,14 +338,57 @@ pub async fn run_recipe(
         .await?;
 
     if !status.success() {
+        // Leave the partial file in place for inspection / debugging.
         return Err(Error::FfmpegFailed {
             status: status.code().unwrap_or(-1),
         });
     }
 
+    // ffmpeg succeeded — atomically promote the partial to the real path.
+    std::fs::rename(&partial, output).map_err(|source| Error::RenameFailed {
+        from: partial.clone(),
+        to: output.to_path_buf(),
+        source,
+    })?;
+
     // `concat_list` drops here, unlinking the temp file.
     drop(concat_list);
     Ok(())
+}
+
+/// Compute the partial-output sibling path for `output`.
+///
+/// Inserts `.partial` between the file stem and the extension so the
+/// resulting filename keeps an extension ffmpeg's muxer-by-extension
+/// inference understands:
+///
+/// - `/path/to/foo.mkv`  →  `/path/to/foo.partial.mkv`
+/// - `/path/to/foo`      →  `/path/to/foo.partial` (no extension to preserve)
+/// - `foo.mkv`           →  `foo.partial.mkv`
+///
+/// The placement-before-extension matters: if we appended `.partial` after
+/// the extension (`foo.mkv.partial`), ffmpeg would refuse to write because
+/// it can't infer the muxer from `.partial`. Rewriting in-place lets us
+/// keep ffmpeg's argv unchanged from the single-target case.
+pub fn partial_sibling(output: &Path) -> PathBuf {
+    let parent = output.parent();
+    let stem = output.file_stem();
+    let ext = output.extension();
+
+    let mut name = OsString::new();
+    if let Some(stem) = stem {
+        name.push(stem);
+    }
+    name.push(".partial");
+    if let Some(ext) = ext {
+        name.push(".");
+        name.push(ext);
+    }
+
+    match parent {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 /// Write a tempfile containing the ffmpeg concat-demuxer list format, one
@@ -698,6 +761,56 @@ file '/tmp/b'\\''s.mp4'
 file '/tmp/c with space.mp4'
 ";
         assert_eq!(content, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // partial_sibling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partial_sibling_inserts_dot_partial_before_extension() {
+        assert_eq!(
+            partial_sibling(Path::new("/path/to/foo.mkv")),
+            PathBuf::from("/path/to/foo.partial.mkv")
+        );
+        assert_eq!(
+            partial_sibling(Path::new("/path/to/foo.mp4")),
+            PathBuf::from("/path/to/foo.partial.mp4")
+        );
+    }
+
+    #[test]
+    fn partial_sibling_handles_extensionless_paths() {
+        assert_eq!(
+            partial_sibling(Path::new("/tmp/foo")),
+            PathBuf::from("/tmp/foo.partial")
+        );
+    }
+
+    #[test]
+    fn partial_sibling_handles_relative_paths() {
+        assert_eq!(
+            partial_sibling(Path::new("foo.mkv")),
+            PathBuf::from("foo.partial.mkv")
+        );
+        assert_eq!(
+            partial_sibling(Path::new("./foo.mkv")),
+            PathBuf::from("./foo.partial.mkv")
+        );
+    }
+
+    #[test]
+    fn partial_sibling_preserves_double_extensions() {
+        // A user-given filename like `archive.tar.gz` has Path::extension()
+        // returning "gz" and Path::file_stem() returning "archive.tar". So
+        // the partial becomes `archive.tar.partial.gz`. We don't pretend to
+        // be smart about double extensions; this is the correct behavior
+        // for ffmpeg's purposes (the LAST component is what its muxer
+        // inference looks at).
+        assert_eq!(
+            partial_sibling(Path::new("/tmp/archive.tar.gz")),
+            PathBuf::from("/tmp/archive.tar.partial.gz")
+        );
     }
 
     /// Regression: ffmpeg's concat demuxer resolves relative paths in the

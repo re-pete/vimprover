@@ -45,6 +45,31 @@ pub enum Error {
     #[error("output file already exists: {0} (pass --overwrite to replace)")]
     OutputExists(PathBuf),
 
+    /// A `.partial.<ext>` sibling of the target output already exists,
+    /// left over from a prior ffmpeg run that failed or was interrupted.
+    /// Refused (rather than silently clobbered) so the user can either
+    /// inspect/recover it or opt in to replacing via `--overwrite`.
+    #[error(
+        "partial output from a prior run exists: {0} \
+         (pass --overwrite to replace, or remove it to retry)"
+    )]
+    PartialOutputExists(PathBuf),
+
+    /// The atomic rename from `<output>.partial.<ext>` to the final output
+    /// path failed. Almost always a cross-filesystem rename (e.g. tmpfs
+    /// output directory) or a permissions issue. The encoded payload is
+    /// preserved at `from` for the user to salvage manually.
+    #[error(
+        "encode succeeded but renaming {from} to {to} failed: {source} \
+         (the encoded file is preserved at {from}; mv it into place manually)"
+    )]
+    RenameFailed {
+        from: PathBuf,
+        to: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("ffmpeg failed (exit {status}); see the output above for details")]
     FfmpegFailed { status: i32 },
 

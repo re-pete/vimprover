@@ -8,29 +8,36 @@ use clap::{Parser, ValueEnum};
 use vimprover::model::Container;
 use vimprover::plan::VideoCodecChoice;
 
-/// `vimprover` — intelligently re-encode, repair, and modernize media files.
-///
-/// Default invocation:
-///
-/// ```text
-/// vimprover INPUT [INPUT...] OUTPUT
-/// ```
-///
-/// The last positional is the output (with or without an extension; if no
-/// extension, the planner picks one based on the recipe). Multi-input concat
-/// will be wired up in a later build-order step. Use `--probe-only` to only
-/// print a probe summary.
+/// Top-level CLI args. The doc-comment becomes `--help` text.
 #[derive(Debug, Parser)]
-#[command(name = "vimprover", version, about, long_about = None)]
+#[command(
+    name = "vimprover",
+    version,
+    about = "Intelligently re-encode, repair, and modernize media files.",
+    long_about = LONG_ABOUT,
+    after_long_help = LONG_EXAMPLES,
+)]
 pub struct Args {
-    /// `INPUT [INPUT...] OUTPUT`. With `--probe-only`, exactly one INPUT.
+    /// Inputs followed by output. The last positional is always the output.
+    ///
+    /// One INPUT → single-file mode (probe + assess + plan + encode).
+    /// Two or more INPUTs → concat mode (stream-copy join, demuxer demands
+    /// uniform inputs). With `--probe-only`, exactly one INPUT.
+    ///
+    /// The output may be given with or without an extension. When omitted,
+    /// vimprover picks the canonical extension for the chosen container
+    /// (`.mkv` by default).
     #[arg(required = true, num_args = 1..)]
     pub paths: Vec<PathBuf>,
 
+    // -----------------------------------------------------------------------
+    // Run control
+    // -----------------------------------------------------------------------
     /// Print the probe summary for a single INPUT and exit.
     #[arg(
         short = 'p',
         long,
+        help_heading = "Run control",
         conflicts_with_all = [
             "dry_run", "overwrite", "reencode", "force", "yes",
             "intent", "max_height", "target_bitrate",
@@ -41,72 +48,151 @@ pub struct Args {
     pub probe_only: bool,
 
     /// Print the plan and the exact ffmpeg command, but don't execute.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help_heading = "Run control")]
     pub dry_run: bool,
 
-    /// Overwrite the output file if it already exists.
-    #[arg(long)]
+    /// Skip the interactive `[Y/n]` confirmation and proceed directly.
+    /// Required for non-interactive use (CI, batch scripts).
+    #[arg(short = 'y', long, help_heading = "Run control")]
+    pub yes: bool,
+
+    /// Overwrite the output if it already exists. Also clears any leftover
+    /// `<output>.partial.<ext>` from a prior failed run.
+    #[arg(long, help_heading = "Run control")]
     pub overwrite: bool,
 
     /// Process the input even if assessment reports it as already fine.
-    /// Without `--force`, vimprover refuses fine files in `Auto` intent mode.
-    /// Explicit `--reencode` already implies forcing, so `--force` is redundant
-    /// (but harmless) when combined with it.
-    #[arg(short = 'f', long)]
+    /// Only relevant in `--intent auto` (the default); explicit intents
+    /// like `--reencode` / `--intent shrink` already bypass the fine-gate.
+    #[arg(short = 'f', long, help_heading = "Run control")]
     pub force: bool,
 
-    /// Skip the interactive `[Y/n]` confirmation prompt and proceed directly.
-    /// Required for non-interactive use (CI, batch scripts).
-    #[arg(short = 'y', long)]
-    pub yes: bool,
-
-    /// Force a re-encode even when stream-copy would work. Implies `--force`
-    /// (you're explicitly asking for work even if the file is fine).
-    /// Mutually exclusive with `--intent`.
-    #[arg(short = 'r', long, conflicts_with = "intent")]
-    pub reencode: bool,
-
-    /// Explicit pipeline intent. When omitted, intent is `auto` (assessment
-    /// drives the choice between remux and re-encode). `--reencode` is a
-    /// shorthand for `--intent reencode`.
-    #[arg(long, value_enum)]
+    // -----------------------------------------------------------------------
+    // Intent
+    // -----------------------------------------------------------------------
+    /// Explicit pipeline intent. Without this, intent is `auto` for one
+    /// input and `concat` for many.
+    ///
+    /// - `auto`     — assessment drives remux vs re-encode (default for 1 input)
+    /// - `remux`    — change container, never re-encode
+    /// - `reencode` — full re-encode regardless of assessment
+    /// - `shrink`   — re-encode at lower bitrate / resolution (see `--max-height` / `--target-bitrate`)
+    /// - `concat`   — multi-input join (default for ≥2 inputs)
+    #[arg(
+        long,
+        value_enum,
+        help_heading = "Intent",
+        verbatim_doc_comment,
+    )]
     pub intent: Option<CliIntent>,
 
-    /// Cap output height in pixels (downscales if the source is taller).
-    /// Only meaningful with `--intent shrink` (or implicit shrink). Common
-    /// values: 720, 1080, 1440.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(120..=8192))]
+    /// Shorthand for `--intent reencode`. Mutually exclusive with `--intent`.
+    #[arg(short = 'r', long, conflicts_with = "intent", help_heading = "Intent")]
+    pub reencode: bool,
+
+    /// Cap output height in pixels (downscale if the source is taller).
+    /// Implies `--intent shrink` when used alone. Common values: 720, 1080, 1440.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(120..=8192),
+        help_heading = "Intent",
+    )]
     pub max_height: Option<u32>,
 
-    /// Target output bitrate in bits/sec for shrink-mode ABR encoding.
-    /// Accepts a plain integer (`5000000`) or a suffixed value (`5M`, `750k`).
-    /// Only meaningful with `--intent shrink`.
-    #[arg(long, value_parser = parse_bitrate)]
+    /// Target output bitrate for shrink-mode ABR encoding. Accepts a plain
+    /// integer (`5000000`) or a suffixed value (`5M`, `750k`, `1.5M`).
+    /// Implies `--intent shrink` when used alone.
+    #[arg(long, value_parser = parse_bitrate, help_heading = "Intent")]
     pub target_bitrate: Option<u64>,
 
-    /// Video codec for re-encode. Default: x264 ≤1080p SDR, x265 above or HDR.
-    #[arg(long, value_enum)]
+    // -----------------------------------------------------------------------
+    // Encoding
+    // -----------------------------------------------------------------------
+    /// Video codec for re-encode. Default: x264 for ≤1080p SDR, x265 above
+    /// or for HDR sources.
+    #[arg(long, value_enum, help_heading = "Encoding")]
     pub video_codec: Option<CliCodec>,
 
     /// Constant Rate Factor (lower = higher quality, larger files).
-    /// Sane range: 18–28 for x264, 20–30 for x265.
-    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
+    /// Reasonable range: 18–28 for x264, 20–30 for x265.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(0..=51),
+        help_heading = "Encoding",
+    )]
     pub crf: Option<u8>,
 
-    /// Encoder preset (`ultrafast`…`veryslow`). Slower presets compress better
-    /// at the cost of encode time. Default: `medium`.
-    #[arg(long)]
+    /// Encoder preset (`ultrafast`…`veryslow`). Slower presets compress
+    /// better at the cost of encode time. Default: `medium`.
+    #[arg(long, help_heading = "Encoding")]
     pub preset: Option<String>,
 
-    /// Output container. Default: `mkv` (most permissive).
-    #[arg(long, value_enum)]
+    /// Output container. Default: `mkv` (most permissive). Can also be
+    /// inferred from the output extension.
+    #[arg(long, value_enum, help_heading = "Encoding")]
     pub container: Option<CliContainer>,
 
-    /// Re-encode multichannel audio to AAC multichannel instead of downmixing
-    /// to AAC stereo (the default).
-    #[arg(long)]
+    /// Re-encode multichannel audio to AAC multichannel instead of
+    /// downmixing to AAC stereo (the default).
+    #[arg(long, help_heading = "Encoding")]
     pub keep_multichannel_audio: bool,
 }
+
+/// Long top-level description, shown on `--help`.
+const LONG_ABOUT: &str = "\
+Intelligently re-encode, repair, and modernize media files.
+
+vimprover probes input files, decides what (if anything) needs to be done
+to bring them up to modern standards, and either does it or explains why
+it won't.
+
+Modes (auto-detected from input count, overridable with --intent):
+  - 1 input  → assess + remux/re-encode/shrink the file
+  - ≥2 inputs → concat them with ffmpeg's demuxer (stream-copy, requires
+                uniform stream parameters across inputs)
+
+Output is written atomically: ffmpeg writes to `<output>.partial.<ext>`
+and we rename it into place on success, so a Ctrl-C halfway through
+won't leave a corrupt file at the user-visible path.";
+
+/// Examples shown after `--help`.
+const LONG_EXAMPLES: &str = "\
+Examples:
+  # Auto-modernize a legacy file (decides remux vs re-encode by itself):
+  vimprover old-movie.vob newname
+
+  # Just print the probe summary, do nothing:
+  vimprover --probe-only some-movie.mkv
+
+  # Print the plan and the exact ffmpeg command, then exit:
+  vimprover --dry-run old-movie.vob newname
+
+  # Force a re-encode regardless of assessment:
+  vimprover --reencode --yes old-movie.vob newname
+
+  # Shrink: cap bitrate at the per-resolution threshold (DWIM):
+  vimprover --intent shrink --yes huge-1080p.mkv smaller
+
+  # Shrink: downscale to 720p (implies --intent shrink):
+  vimprover --max-height 720 --yes huge-1080p.mkv smaller
+
+  # Shrink: explicit target bitrate:
+  vimprover --target-bitrate 2.5M --yes huge.mkv smaller
+
+  # Force x265 + MP4, custom CRF, slower preset for better compression:
+  vimprover --reencode --video-codec x265 --container mp4 \\
+            --crf 22 --preset slow --yes old-movie.vob newname
+
+  # Concat (multi-input → single output, demuxer-mode stream-copy):
+  vimprover --yes part1.mp4 part2.mp4 part3.mp4 joined
+
+  # Verbose tracing (logs the exact ffprobe/ffmpeg commands):
+  VIMPROVER_LOG=info vimprover --yes old-movie.vob newname
+
+Environment:
+  VIMPROVER_FFMPEG    path to ffmpeg binary (default: from $PATH)
+  VIMPROVER_FFPROBE   path to ffprobe binary (default: from $PATH)
+  VIMPROVER_LOG       tracing-subscriber filter (default: warn)";
 
 /// Output container choice exposed on the CLI.
 #[derive(Debug, Clone, Copy, ValueEnum)]
