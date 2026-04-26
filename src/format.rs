@@ -70,6 +70,32 @@ pub fn render_concat_recipe(
     render_aligned_block("Plan:", &lines)
 }
 
+/// Render a plan-summary block for an `--upgrade` run.
+///
+/// Uses the same body as [`render_recipe`] but tags on one of:
+///
+/// - `(original <input> will be preserved unchanged)` — when no backup is
+///   needed (the output has a different extension than the input).
+/// - `(original will be renamed to <backup>)` — when a backup is needed
+///   (output would otherwise clobber the input).
+pub fn render_upgrade_recipe(
+    recipe: &EncodeRecipe,
+    input: &Path,
+    output: &Path,
+    backup: Option<&Path>,
+) -> String {
+    let mut lines = collect_plan_lines(recipe, output);
+    let tail = match backup {
+        Some(backup_path) => format!(
+            "(original will be renamed to {})",
+            backup_path.display()
+        ),
+        None => format!("(original {} will be preserved unchanged)", input.display()),
+    };
+    lines.push(tail);
+    render_aligned_block("Plan:", &lines)
+}
+
 /// Render an assessment as a single "Issues:" block, or `None` if the file
 /// is fine. Matches the column alignment of [`render_profile`] and
 /// [`render_recipe`].
@@ -729,5 +755,61 @@ mod tests {
         let out = render_concat_recipe(&recipe, &inputs, Path::new("joined.mp4"));
         assert!(out.contains("Concat 2 inputs"), "got:\n{out}");
         assert!(out.contains("Enable MP4 faststart"), "got:\n{out}");
+    }
+
+    #[test]
+    fn renders_upgrade_recipe_without_backup() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mkv,
+            video_strategy: VideoStrategy::ReencodeX264 {
+                crf: 20,
+                preset: "medium".into(),
+            },
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::AacStereo { bitrate_bps: 192_000 },
+            extra_flags: Vec::new(),
+            concat: None,
+        };
+        let out = render_upgrade_recipe(
+            &recipe,
+            Path::new("/home/u/myfile.wmv"),
+            Path::new("/home/u/myfile.mkv"),
+            None,
+        );
+        assert!(out.contains("Re-encode video to H.264"), "got:\n{out}");
+        assert!(out.contains("Output: /home/u/myfile.mkv"), "got:\n{out}");
+        assert!(
+            out.contains("(original /home/u/myfile.wmv will be preserved unchanged)"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn renders_upgrade_recipe_with_backup() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mkv,
+            video_strategy: VideoStrategy::ReencodeX265 {
+                crf: 22,
+                preset: "medium".into(),
+            },
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: Vec::new(),
+            concat: None,
+        };
+        let out = render_upgrade_recipe(
+            &recipe,
+            Path::new("/home/u/myfile.mkv"),
+            Path::new("/home/u/myfile.mkv"),
+            Some(Path::new("/home/u/myfile.vimprover-orig.mkv")),
+        );
+        assert!(out.contains("Re-encode video to H.265"), "got:\n{out}");
+        assert!(out.contains("Output: /home/u/myfile.mkv"), "got:\n{out}");
+        assert!(
+            out.contains(
+                "(original will be renamed to /home/u/myfile.vimprover-orig.mkv)"
+            ),
+            "got:\n{out}"
+        );
     }
 }

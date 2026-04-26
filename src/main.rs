@@ -24,6 +24,21 @@
 //! 5. Dry-run / confirmation prompt as in single-file flow.
 //! 6. Execute via [`vimprover::execute::run_recipe`] (which writes the
 //!    concat-demuxer list file under the hood).
+//!
+//! Upgrade flow (`--upgrade`, single input, no explicit output):
+//!
+//! 1. Parse CLI args; reject multi-input or explicit-output combinations.
+//! 2. Same probe/assess/plan as the single-file flow.
+//! 3. [`vimprover::plan::resolve_upgrade_paths`] decides where the encoded
+//!    output goes (next to the input, with the recipe's container ext) and
+//!    whether a backup rename is needed (only if the output would collide
+//!    with the input — i.e. same container).
+//! 4. Render plan with [`vimprover::format::render_upgrade_recipe`], which
+//!    notes either "original preserved unchanged" or "original will be
+//!    renamed to …".
+//! 5. Dry-run / confirmation prompt as usual.
+//! 6. If a backup is needed, rename input → backup *before* spawning ffmpeg.
+//!    On any encode failure, attempt a best-effort rollback of that rename.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -54,9 +69,34 @@ async fn main() -> Result<()> {
         return run_probe_only(&args.paths).await;
     }
 
+    let flags = FlowFlags {
+        dry_run: args.dry_run,
+        overwrite: args.overwrite,
+        force: args.force,
+        yes: args.yes,
+    };
+
+    // --upgrade short-circuit: takes exactly one INPUT, no OUTPUT positional.
+    // Output path is auto-computed from the input + the recipe's container.
+    if args.upgrade {
+        if args.paths.len() != 1 {
+            bail!(
+                "--upgrade takes exactly one INPUT (got {}); \
+                 for concat or explicit-output runs, omit --upgrade",
+                args.paths.len()
+            );
+        }
+        let intent = intent_from_args(&args);
+        if matches!(intent, Intent::Concat) {
+            bail!("--intent concat is incompatible with --upgrade");
+        }
+        let overrides = overrides_from_args(&args, None);
+        return run_upgrade(&args.paths[0], intent, overrides, flags).await;
+    }
+
     if args.paths.len() < 2 {
         bail!(
-            "expected `INPUT [INPUT...] OUTPUT` (got {} path{})",
+            "expected `INPUT [INPUT...] OUTPUT` or `--upgrade INPUT` (got {} path{})",
             args.paths.len(),
             if args.paths.len() == 1 { "" } else { "s" }
         );
@@ -67,13 +107,7 @@ async fn main() -> Result<()> {
     let inputs = paths;
 
     let intent = intent_from_args(&args);
-    let overrides = overrides_from_args(&args, &user_output);
-    let flags = FlowFlags {
-        dry_run: args.dry_run,
-        overwrite: args.overwrite,
-        force: args.force,
-        yes: args.yes,
-    };
+    let overrides = overrides_from_args(&args, Some(&user_output));
 
     // Multi-input ⇒ concat flow. Single-input + Intent::Concat is rejected
     // upstream by the planner via `Error::ConcatTooFewInputs`.
@@ -143,15 +177,16 @@ fn intent_from_args(args: &Args) -> Intent {
     }
 }
 
-fn overrides_from_args(args: &Args, output_path: &Path) -> Overrides {
+fn overrides_from_args(args: &Args, output_path: Option<&Path>) -> Overrides {
     // Explicit --container wins; otherwise infer from a recognized extension
     // on the output path (e.g. `out.mp4` → MP4). Per CLAUDE.md: "OUTPUT_NAME
     // without extension lets the planner pick the container. With extension
-    // forces it."
+    // forces it." For `--upgrade` there's no user-supplied output path, so
+    // only the explicit flag (if any) drives the container.
     let container = args
         .container
         .map(Into::into)
-        .or_else(|| plan::container_from_output_extension(output_path));
+        .or_else(|| output_path.and_then(plan::container_from_output_extension));
 
     Overrides {
         container,
@@ -364,6 +399,164 @@ async fn run_concat(
             elapsed,
         )
     );
+    Ok(())
+}
+
+/// Single-input `--upgrade` flow. Same probe/assess/plan as
+/// [`run_single_file`], but the output path is computed from the input
+/// (placed alongside it with the recipe's container extension) and a
+/// backup-rename dance protects the original on a same-container upgrade.
+async fn run_upgrade(
+    input: &Path,
+    intent: Intent,
+    overrides: Overrides,
+    flags: FlowFlags,
+) -> Result<()> {
+    // 1. Probe.
+    let profile: MediaProfile = probe::probe_file(input)
+        .await
+        .with_context(|| format!("probing {}", input.display()))?;
+    println!("{}", format::render_profile(input, &profile));
+
+    // 2. Assess.
+    let assessment = assess::assess(&profile, &intent);
+    if let Some(issues_block) = format::render_assessment(&assessment) {
+        println!();
+        println!("{issues_block}");
+    }
+
+    // 3. Fine-gate (Auto only).
+    if matches!(intent, Intent::Auto) && assessment.is_fine() && !flags.force {
+        println!();
+        bail!(
+            "{} is already fine — pass --force to process anyway, \
+             or use --reencode / --intent for an explicit action.",
+            input.display()
+        );
+    }
+
+    // 4. Plan.
+    let recipe = plan::plan(&profile, &assessment, &intent, &overrides)
+        .with_context(|| "planning")?;
+
+    // 5. Resolve upgrade paths.
+    let paths = plan::resolve_upgrade_paths(input, &recipe);
+
+    // 6. Render the plan with the upgrade caveat.
+    println!();
+    println!(
+        "{}",
+        format::render_upgrade_recipe(&recipe, input, &paths.output, paths.backup.as_deref())
+    );
+
+    // 7. Pre-flight: refuse if the output (when it's a different file from
+    //    the input) or the backup already exists, unless --overwrite.
+    if !flags.overwrite {
+        if paths.output != input && paths.output.exists() {
+            bail!(
+                "output already exists: {} (pass --overwrite to replace)",
+                paths.output.display()
+            );
+        }
+        if let Some(ref backup) = paths.backup {
+            if backup.exists() {
+                bail!(
+                    "backup file from a prior upgrade exists: {} \
+                     (pass --overwrite to replace, or remove it manually)",
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    // 8. Dry-run short-circuit. We render the argv against the *current*
+    //    input path even in the same-container case — the actual run will
+    //    read from the backup path after the rename, but dry-run is a
+    //    preview and using the visible path here is more readable.
+    if flags.dry_run {
+        let ffmpeg = execute::locate_ffmpeg()?;
+        let argv = execute::build_ffmpeg_args(
+            &[input],
+            std::slice::from_ref(&profile.container),
+            &paths.output,
+            &recipe,
+            flags.overwrite,
+            None,
+        );
+        println!();
+        println!("Command:   {}", execute::render_command(&ffmpeg, &argv));
+        println!();
+        println!("(dry run — not executing)");
+        return Ok(());
+    }
+
+    // 9. Confirmation prompt.
+    if !flags.yes && !confirm_proceed()? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // 10. Execute. Backup-then-encode dance with rollback on failure.
+    println!();
+    println!("Running ffmpeg…");
+    let input_size = std::fs::metadata(input).ok().map(|m| m.len());
+    let started = Instant::now();
+
+    // Clear stale backup if --overwrite is set (the user opted in above).
+    if flags.overwrite {
+        if let Some(ref backup) = paths.backup {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+
+    // Step A: backup rename (only if needed).
+    if let Some(ref backup) = paths.backup {
+        std::fs::rename(input, backup).with_context(|| {
+            format!(
+                "renaming original to backup ({} → {})",
+                input.display(),
+                backup.display()
+            )
+        })?;
+    }
+
+    // Step B: encode. In the same-container case the input now lives at
+    //         the backup path; otherwise it's still at its original path.
+    let encode_input = paths.backup.as_deref().unwrap_or(input);
+    let encode_result = execute::run_recipe(
+        &[encode_input],
+        std::slice::from_ref(&profile.container),
+        &paths.output,
+        &recipe,
+        flags.overwrite,
+    )
+    .await;
+
+    // Step C: handle failure with best-effort rollback of the backup rename.
+    if let Err(e) = encode_result {
+        if let Some(ref backup) = paths.backup {
+            if let Err(restore_err) = std::fs::rename(backup, input) {
+                eprintln!(
+                    "warning: upgrade failed and could not restore backup {} to {}: {restore_err}",
+                    backup.display(),
+                    input.display(),
+                );
+                eprintln!("the original file is preserved at: {}", backup.display());
+            }
+        }
+        return Err(e).with_context(|| format!("encoding to {}", paths.output.display()));
+    }
+
+    let elapsed = started.elapsed();
+    let output_size = std::fs::metadata(&paths.output).map(|m| m.len()).unwrap_or(0);
+
+    println!(
+        "{}",
+        format::render_completion_summary(&paths.output, input_size, output_size, elapsed)
+    );
+    if let Some(ref backup) = paths.backup {
+        println!("Original preserved at: {}", backup.display());
+    }
     Ok(())
 }
 

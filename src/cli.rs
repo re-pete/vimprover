@@ -22,7 +22,8 @@ pub struct Args {
     ///
     /// One INPUT → single-file mode (probe + assess + plan + encode).
     /// Two or more INPUTs → concat mode (stream-copy join, demuxer demands
-    /// uniform inputs). With `--probe-only`, exactly one INPUT.
+    /// uniform inputs). With `--probe-only` or `--upgrade`, exactly one
+    /// INPUT and no OUTPUT.
     ///
     /// The output may be given with or without an extension. When omitted,
     /// vimprover picks the canonical extension for the chosen container
@@ -39,13 +40,25 @@ pub struct Args {
         long,
         help_heading = "Run control",
         conflicts_with_all = [
-            "dry_run", "overwrite", "reencode", "force", "yes",
+            "dry_run", "overwrite", "reencode", "force", "yes", "upgrade",
             "intent", "max_height", "target_bitrate",
             "video_codec", "crf", "preset",
             "container", "keep_multichannel_audio",
         ],
     )]
     pub probe_only: bool,
+
+    /// Upgrade a single INPUT in place. No OUTPUT is given; vimprover
+    /// writes the upgraded file next to the input with the chosen
+    /// container's extension (e.g. `myfile.wmv` → `myfile.mkv`). When the
+    /// output would collide with the input (same container), the original
+    /// is renamed aside to `<stem>.vimprover-orig.<ext>` before encoding.
+    /// On any failure, the backup is restored to its original name.
+    ///
+    /// Refuses if the output path or backup path already exists unless
+    /// `--overwrite` is passed. Incompatible with concat (multi-input) mode.
+    #[arg(long, help_heading = "Run control")]
+    pub upgrade: bool,
 
     /// Print the plan and the exact ffmpeg command, but don't execute.
     #[arg(short = 'n', long, help_heading = "Run control")]
@@ -147,7 +160,10 @@ to bring them up to modern standards, and either does it or explains why
 it won't.
 
 Modes (auto-detected from input count, overridable with --intent):
-  - 1 input  → assess + remux/re-encode/shrink the file
+  - 1 input   → assess + remux/re-encode/shrink the file
+  - --upgrade → 1 input, output name is auto-computed next to the input
+                (original is preserved, renamed aside if the container
+                doesn't change)
   - ≥2 inputs → concat them with ffmpeg's demuxer (stream-copy, requires
                 uniform stream parameters across inputs)
 
@@ -158,7 +174,15 @@ won't leave a corrupt file at the user-visible path.";
 /// Examples shown after `--help`.
 const LONG_EXAMPLES: &str = "\
 Examples:
-  # Auto-modernize a legacy file (decides remux vs re-encode by itself):
+  # Upgrade a legacy file in place (original preserved as myfile.wmv):
+  vimprover --upgrade myfile.wmv
+
+  # Upgrade an MKV that needs a re-encode; original is renamed aside to
+  # myfile.vimprover-orig.mkv before encoding, and the new MKV takes its
+  # place on success:
+  vimprover --upgrade --intent shrink myfile.mkv
+
+  # Auto-modernize with an explicit output name:
   vimprover old-movie.vob newname
 
   # Just print the probe summary, do nothing:

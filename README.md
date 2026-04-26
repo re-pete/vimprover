@@ -10,22 +10,53 @@ The full design — including the build order this work follows — lives in
 
 ## Status
 
-**Build-order step 6: concat mode.** Multiple inputs (≥2) trigger
-demuxer-based stream-copy concatenation. The planner probes every input,
-verifies they share codec / resolution / pixel format / framerate / audio
-parameters, and — when uniform — joins them via ffmpeg's `-f concat`
-demuxer with no re-encoding (typically 10× faster than re-encoding).
+**Step 7: polish, round 1 — done.** The full single-file pipeline
+(probe → assess → plan → format → execute), single-file shrink,
+multi-input concat, and the first polish round all work end-to-end.
 
-Non-uniform inputs are refused with a precise error naming the offending
-input and the field that differs, plus a hint to normalize via
-`vimprover --reencode` or `--intent shrink` first. Phase 1 deliberately
-stops there; the filter-concat re-encode-to-common-spec path is deferred
-until there's demand.
+**Concat mode (≥2 inputs).** Triggers demuxer-based stream-copy
+concatenation. The planner probes every input, verifies they share
+codec / resolution / pixel format / framerate / audio parameters, and —
+when uniform — joins them via ffmpeg's `-f concat` demuxer with no
+re-encoding (typically 10× faster than re-encoding). Non-uniform inputs
+are refused with a precise error naming the offending input and the
+field that differs, plus a hint to normalize via `vimprover --reencode`
+or `--intent shrink` first. The filter-concat re-encode-to-common-spec
+path is deferred until there's demand.
 
-Everything from earlier steps still applies: assess(), the `Issues:`
-block, the `[Y/n]` prompt unless `--yes`, fine-gate, intent overrides.
-`--intent shrink` adds bitrate-excessive / resolution-wasteful flagging
-and single-pass ABR encoding.
+**Polish highlights (round 1):**
+
+- **Atomic output.** ffmpeg writes to `<output>.partial.<ext>` and
+  vimprover atomically renames it to the final path on success. A
+  crash or Ctrl-C halfway through never leaves a corrupt file at the
+  user-visible path. Stale partials from a prior failed run are
+  refused until cleared (either manually or with `--overwrite`).
+- **Completion summary.** Post-encode line shows input→output sizes,
+  percent change, and wall-clock duration — e.g.
+  `Done. Wrote out.mkv (847 MiB → 312 MiB, 63% smaller, 8m12s).`
+- **Organized `--help`.** Flags grouped into *Run control / Intent /
+  Encoding* sections, with a verbose `--help` that includes a worked
+  examples block and an environment variables section.
+
+**`--upgrade`: upgrade-in-place.** A single-input mode that auto-computes
+the output path from the input and the chosen container. The original is
+preserved either by sitting at its original path (when the container
+changes — `myfile.wmv` and the new `myfile.mkv` end up side-by-side) or
+by being renamed aside to `<stem>.vimprover-orig.<ext>` before encoding
+(when the container stays the same). On any encode failure, the rename
+is rolled back so the user sees the original at its original path.
+Refuses to clobber pre-existing outputs or stale backups without
+`--overwrite`.
+
+**Everything from earlier steps still applies:** `assess()`, the
+`Issues:` block, the `[Y/n]` prompt unless `--yes`, the fine-gate
+(refuses already-fine files in `Auto` mode without `--force`), intent
+overrides, and `--intent shrink` with bitrate-excessive /
+resolution-wasteful flagging plus single-pass ABR encoding.
+
+**Deferred:** a parsed progress bar (via `ffmpeg -progress pipe:1`).
+ffmpeg's native `frame=… time=…` stats line is inherited to the
+terminal in the meantime, which is good enough for a v1.
 
 ## Requirements
 
@@ -43,8 +74,19 @@ cargo build --release # optimized
 ## Run
 
 ```sh
-# Auto-modernize a legacy file. assess() decides: legacy codec/interlacing
-# ⇒ re-encode; legacy container only ⇒ remux. Prompts for confirmation.
+# Upgrade-in-place. No OUTPUT path needed: vimprover writes next to
+# the input (myfile.wmv → myfile.mkv) and preserves the original
+# unchanged at its original path. Recommended for most uses.
+cargo run -- --upgrade myfile.wmv
+
+# Same idea, but reencode an MKV that needs improvement. The original
+# is renamed aside to myfile.vimprover-orig.mkv before encoding starts;
+# rolled back if anything fails.
+cargo run -- --upgrade --reencode myfile.mkv
+
+# Auto-modernize with an explicit OUTPUT name. assess() decides: legacy
+# codec/interlacing ⇒ re-encode; legacy container only ⇒ remux. Prompts
+# for confirmation.
 cargo run -- old-movie.vob newname
 
 # Skip the [Y/n] prompt (required for non-TTY use):
@@ -125,7 +167,7 @@ Proceed? [Y/n] y
 
 Running ffmpeg…
 …
-Done. Wrote newname.mkv.
+Done. Wrote newname.mkv (4.2 GiB → 2.1 GiB, 50% smaller, 18m42s).
 ```
 
 ## Test
@@ -153,8 +195,8 @@ src/
 ├── probe.rs     # ffprobe runner + JSON → MediaProfile
 ├── format.rs    # human-readable rendering of profiles & recipes
 ├── assess.rs    # "is this file fine?" check (Issue, Assessment, assess())
-├── plan.rs      # MediaProfile → EncodeRecipe (remux + re-encode; shrink/concat stubbed)
-└── execute.rs   # build ffmpeg argv, run it, surface errors
+├── plan.rs      # MediaProfile → EncodeRecipe (remux, re-encode, shrink, concat)
+└── execute.rs   # build ffmpeg argv, run it (atomic partial→rename), surface errors
 
 tests/
 └── remux.rs     # end-to-end integration tests (needs ffmpeg)

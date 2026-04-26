@@ -700,6 +700,102 @@ pub fn container_from_output_extension(path: &Path) -> Option<Container> {
     }
 }
 
+/// Output and (optional) backup paths for an `--upgrade` run, computed
+/// from the input path and the recipe's chosen output container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradePaths {
+    /// Where the encoded output will be written (same directory as input,
+    /// input's stem + the recipe's canonical container extension).
+    pub output: PathBuf,
+    /// Where to move the original to *before* encoding starts, when the
+    /// output path would otherwise collide with the input. `None` means
+    /// no backup rename is needed and the original stays put.
+    pub backup: Option<PathBuf>,
+}
+
+/// Compute the output and (optional) backup paths for an `--upgrade` run.
+///
+/// The output is placed next to the input, with the input's meaningful
+/// stem and the recipe's canonical container extension. A backup is only
+/// produced when the output path would collide with the input path (same
+/// container); in that case the original is earmarked for a rename to
+/// `<stem>.vimprover-orig.<ext>` before encoding.
+///
+/// "Meaningful stem" extraction uses an allow-list of known media
+/// extensions to avoid mangling filenames that happen to contain periods
+/// (e.g. `Tutorial #10 (MC 1.7.10) (Low)` — `Path::extension` would return
+/// `10) (Low)` there, which we ignore).
+pub fn resolve_upgrade_paths(input: &Path, recipe: &EncodeRecipe) -> UpgradePaths {
+    let parent = input.parent().unwrap_or_else(|| Path::new(""));
+    let target_ext = recipe.output_container.canonical_extension();
+
+    let filename = input.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let (stem, input_ext) = split_at_media_extension(filename);
+
+    let output = parent.join(format!("{stem}.{target_ext}"));
+
+    let backup = if output == input {
+        // Case B: output would clobber input — we must rename aside. When
+        // we're here `input_ext` is guaranteed to be `Some` (the output
+        // path carries `target_ext`, and `output == input` implies the
+        // input does too), but fall back to `target_ext` defensively.
+        let backup_ext = input_ext.unwrap_or(target_ext);
+        Some(parent.join(format!("{stem}.vimprover-orig.{backup_ext}")))
+    } else {
+        None
+    };
+
+    UpgradePaths { output, backup }
+}
+
+/// Split a filename into `(stem, optional_extension)`, treating only
+/// recognized media extensions as actual extensions. Filenames whose last
+/// "extension" isn't in the media allow-list are returned as `(whole, None)`
+/// so we don't mangle titles containing periods.
+fn split_at_media_extension(filename: &str) -> (&str, Option<&str>) {
+    if let Some(dot_pos) = filename.rfind('.') {
+        let ext = &filename[dot_pos + 1..];
+        if is_media_extension(ext) {
+            return (&filename[..dot_pos], Some(ext));
+        }
+    }
+    (filename, None)
+}
+
+/// Common media-file extensions that vimprover might see as inputs. Used
+/// solely by [`resolve_upgrade_paths`] to decide where the filename stem
+/// ends. Not exhaustive — unfamiliar extensions just get treated as part
+/// of the stem (conservative: means a `.mkv` is appended after them).
+fn is_media_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mkv"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "webm"
+            | "avi"
+            | "wmv"
+            | "asf"
+            | "flv"
+            | "f4v"
+            | "mpg"
+            | "mpeg"
+            | "m2v"
+            | "vob"
+            | "ts"
+            | "m2ts"
+            | "mts"
+            | "ogv"
+            | "ogm"
+            | "3gp"
+            | "3g2"
+            | "rm"
+            | "rmvb"
+            | "divx"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1507,6 +1603,104 @@ mod tests {
             container_from_output_extension(Path::new("Tutorial (MC 1.7.10) (Low)")),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_upgrade_paths
+    // -----------------------------------------------------------------------
+
+    /// Most common case: legacy container → MKV. No collision, so no backup.
+    #[test]
+    fn upgrade_paths_different_extension_no_backup() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(Path::new("/home/u/myfile.wmv"), &recipe);
+        assert_eq!(paths.output, PathBuf::from("/home/u/myfile.mkv"));
+        assert_eq!(paths.backup, None);
+    }
+
+    /// Same container (MKV → MKV): output collides with input, so a backup
+    /// is required. The backup filename puts `vimprover-orig` *before* the
+    /// extension so the backup keeps its double-click behavior.
+    #[test]
+    fn upgrade_paths_same_extension_needs_backup() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(Path::new("/home/u/myfile.mkv"), &recipe);
+        assert_eq!(paths.output, PathBuf::from("/home/u/myfile.mkv"));
+        assert_eq!(
+            paths.backup,
+            Some(PathBuf::from("/home/u/myfile.vimprover-orig.mkv"))
+        );
+    }
+
+    /// Bare filename (no directory): parent-less join should still produce
+    /// a sensible result.
+    #[test]
+    fn upgrade_paths_relative_filename_only() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(Path::new("myfile.wmv"), &recipe);
+        assert_eq!(paths.output, PathBuf::from("myfile.mkv"));
+        assert_eq!(paths.backup, None);
+    }
+
+    /// Filename with periods in its title (no real extension). The allow-list
+    /// means we don't mangle it — the entire filename is the stem, and we
+    /// append `.mkv` after it.
+    #[test]
+    fn upgrade_paths_preserves_filenames_with_embedded_periods() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(
+            Path::new("Tutorial #10 (MC 1.7.10) (Low)"),
+            &recipe,
+        );
+        assert_eq!(
+            paths.output,
+            PathBuf::from("Tutorial #10 (MC 1.7.10) (Low).mkv"),
+        );
+        assert_eq!(paths.backup, None);
+    }
+
+    /// Same as above but WITH a recognized media extension — the stem
+    /// should drop only the trailing `.wmv`.
+    #[test]
+    fn upgrade_paths_preserves_titles_with_real_extension() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(
+            Path::new("Tutorial #10 (MC 1.7.10) (Low).wmv"),
+            &recipe,
+        );
+        assert_eq!(
+            paths.output,
+            PathBuf::from("Tutorial #10 (MC 1.7.10) (Low).mkv"),
+        );
+        assert_eq!(paths.backup, None);
+    }
+
+    /// Forced MP4 container with an MP4 input → collision → backup needed.
+    #[test]
+    fn upgrade_paths_same_extension_mp4_backup() {
+        let overrides = Overrides {
+            container: Some(Container::Mp4),
+            ..Overrides::default()
+        };
+        let recipe = plan_remux(&sample_profile(), &overrides);
+        let paths = resolve_upgrade_paths(Path::new("/tmp/holiday.mp4"), &recipe);
+        assert_eq!(paths.output, PathBuf::from("/tmp/holiday.mp4"));
+        assert_eq!(
+            paths.backup,
+            Some(PathBuf::from("/tmp/holiday.vimprover-orig.mp4"))
+        );
+    }
+
+    /// Uppercase extension: PathBuf equality is case-sensitive on Linux, so
+    /// `myfile.MKV` != `myfile.mkv` and we produce an output without a
+    /// backup. The user ends up with both files side-by-side (the original
+    /// untouched at its original case).
+    #[test]
+    fn upgrade_paths_case_sensitive_extension_sees_no_collision() {
+        let recipe = plan_remux(&sample_profile(), &Overrides::default());
+        let paths = resolve_upgrade_paths(Path::new("/t/Movie.MKV"), &recipe);
+        assert_eq!(paths.output, PathBuf::from("/t/Movie.mkv"));
+        assert_eq!(paths.backup, None);
     }
 
     // -----------------------------------------------------------------------

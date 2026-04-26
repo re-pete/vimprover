@@ -1119,3 +1119,288 @@ fn overwrite_clears_stale_partial_and_succeeds() {
         "stale partial should have been replaced"
     );
 }
+
+// -----------------------------------------------------------------------
+// --upgrade flow (single input, no positional output)
+// -----------------------------------------------------------------------
+
+/// Case A: legacy container → modern container. Output gets the new
+/// extension and the original is preserved unchanged at its original path.
+#[test]
+fn upgrade_legacy_avi_writes_mkv_and_preserves_original() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.avi");
+    let expected_output = dir.path().join("clip.mkv");
+
+    assert!(synthesize_divx_avi(&input), "synthesize divx avi");
+    let original_size = std::fs::metadata(&input).expect("stat input").len();
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--yes")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("will be preserved unchanged"),
+        "case-A plan should announce no rename:\n{stdout}"
+    );
+
+    // Original survives at its original path with its original size.
+    assert!(input.exists(), "original was deleted unexpectedly");
+    assert_eq!(
+        std::fs::metadata(&input).expect("stat input").len(),
+        original_size,
+        "original file was modified"
+    );
+    // New output exists.
+    assert!(expected_output.exists(), "expected output not created");
+    // No backup was produced.
+    assert!(
+        !dir.path().join("clip.vimprover-orig.avi").exists(),
+        "no backup should be produced when extensions differ"
+    );
+}
+
+/// Case B: same container → reencode in place. Output collides with input,
+/// so the original is renamed aside to `<stem>.vimprover-orig.<ext>` before
+/// encoding.
+#[test]
+fn upgrade_same_container_creates_backup() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.mp4");
+    let expected_backup = dir.path().join("clip.vimprover-orig.mp4");
+
+    assert!(synthesize_uniform_480p_mp4(&input, 440), "synthesize mp4");
+    let original_size = std::fs::metadata(&input).expect("stat input").len();
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--reencode")
+        .arg("--container")
+        .arg("mp4")
+        .arg("--yes")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("will be renamed to"),
+        "case-B plan should announce backup rename:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Original preserved at:"),
+        "case-B summary should print backup path:\n{stdout}"
+    );
+
+    // Backup exists with the original's size.
+    assert!(expected_backup.exists(), "backup not created");
+    assert_eq!(
+        std::fs::metadata(&expected_backup).expect("stat backup").len(),
+        original_size,
+        "backup is not the original file"
+    );
+    // New file at the original path.
+    assert!(input.exists(), "encoded file should be at original path");
+}
+
+/// Case B with a pre-existing backup file: refuse rather than clobber it.
+#[test]
+fn upgrade_refuses_stale_backup_without_overwrite() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.mp4");
+    let stale_backup = dir.path().join("clip.vimprover-orig.mp4");
+
+    assert!(synthesize_uniform_480p_mp4(&input, 440));
+    std::fs::write(&stale_backup, b"stale-backup-from-prior-run")
+        .expect("seed stale backup");
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--reencode")
+        .arg("--container")
+        .arg("mp4")
+        .arg("--yes")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        !result.status.success(),
+        "expected vimprover to refuse, but it succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("backup file from a prior upgrade exists"),
+        "expected stale-backup refusal message:\n{stderr}"
+    );
+
+    // Stale backup is preserved (not clobbered).
+    let stale_contents =
+        std::fs::read(&stale_backup).expect("read stale backup after refusal");
+    assert_eq!(stale_contents, b"stale-backup-from-prior-run");
+}
+
+/// Case B with `--overwrite`: stale backup is cleared and the upgrade
+/// succeeds, with the new backup containing the *current* original.
+#[test]
+fn upgrade_overwrite_replaces_stale_backup() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.mp4");
+    let backup_path = dir.path().join("clip.vimprover-orig.mp4");
+
+    assert!(synthesize_uniform_480p_mp4(&input, 440));
+    let original_size = std::fs::metadata(&input).expect("stat input").len();
+    std::fs::write(&backup_path, b"stale-backup-from-prior-run")
+        .expect("seed stale backup");
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--reencode")
+        .arg("--container")
+        .arg("mp4")
+        .arg("--overwrite")
+        .arg("--yes")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // Backup now holds the *current* original (not the stale-backup bytes).
+    let backup_size = std::fs::metadata(&backup_path).expect("stat backup").len();
+    assert_eq!(
+        backup_size, original_size,
+        "backup should be the freshly-renamed original, not the stale bytes"
+    );
+}
+
+/// `--upgrade` rejects multi-input invocations: it's a single-file mode.
+#[test]
+fn upgrade_with_multiple_inputs_is_rejected() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let a = dir.path().join("a.mp4");
+    let b = dir.path().join("b.mp4");
+    assert!(synthesize_uniform_480p_mp4(&a, 440));
+    assert!(synthesize_uniform_480p_mp4(&b, 880));
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--yes")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        !result.status.success(),
+        "vimprover should refuse --upgrade with 2 inputs"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--upgrade takes exactly one INPUT"),
+        "expected explicit 1-input refusal:\n{stderr}"
+    );
+
+    // Neither input was modified, no output produced.
+    assert!(a.exists() && b.exists());
+    assert!(!dir.path().join("a.mkv").exists());
+    assert!(!dir.path().join("a.vimprover-orig.mp4").exists());
+}
+
+/// `--upgrade --dry-run` prints the plan and the ffmpeg command without
+/// touching the filesystem at all (no rename, no output, no backup).
+#[test]
+fn upgrade_dry_run_does_not_touch_files() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.mp4");
+    assert!(synthesize_uniform_480p_mp4(&input, 440));
+    let original_size = std::fs::metadata(&input).expect("stat input").len();
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--reencode")
+        .arg("--container")
+        .arg("mp4")
+        .arg("--dry-run")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "dry-run upgrade should succeed: stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("Plan:"), "expected plan in stdout:\n{stdout}");
+    assert!(
+        stdout.contains("(dry run — not executing)"),
+        "expected dry-run notice:\n{stdout}"
+    );
+
+    // Filesystem is untouched.
+    assert!(input.exists(), "input should still exist");
+    assert_eq!(
+        std::fs::metadata(&input).expect("stat input").len(),
+        original_size,
+        "input was modified by dry-run"
+    );
+    assert!(
+        !dir.path().join("clip.vimprover-orig.mp4").exists(),
+        "dry-run should not create a backup"
+    );
+}
