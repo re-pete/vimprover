@@ -10,21 +10,28 @@ The full design — including the build order this work follows — lives in
 
 ## Status
 
-**Build-order step 4: assessment + interactive prompt.** `vimprover INPUT OUTPUT`
-now probes the input, runs an `assess()` pass that flags every issue (legacy
-codec, container, audio codec, interlacing, non-modern pixel format,
-non-square pixels), prints them under an `Issues:` block, then routes
-`Intent::Auto` to either remux or re-encode based on what was found. Files
-that pass every check are refused with a friendly "already fine" message —
-pass `--force` to process them anyway.
+**Build-order step 5: shrink mode.** Adds an explicit `--intent shrink`
+that re-encodes a file at a smaller bitrate and/or resolution, with
+intent-aware assessment that flags `BitrateExcessive` (above the
+per-resolution threshold) and `ResolutionWasteful` (1440p+ at low
+bits-per-pixel). Encoding uses single-pass ABR (`-b:v / -maxrate /
+-bufsize`) so the output bitrate is predictable.
 
-All user-facing destructive actions go through a `[Y/n]` prompt (default
-yes) unless `--yes` is passed. Non-TTY stdin requires `--yes` explicitly
-so batch scripts have to opt into non-interactive runs.
+Three shrink modes:
 
-Explicit intents — `--reencode` (and the eventual `--intent` flag) —
-bypass the fine-gate and the prompt is still shown. `--probe-only` and
-`--dry-run` short-circuit before the prompt.
+- `--intent shrink` (no targets): DWIM — cap output bitrate at the
+  threshold for the source's height. Refuses if the source is already at
+  or below threshold ("nothing to shrink").
+- `--intent shrink --max-height 720`: downscale 16:9-correctly and target
+  the 720p threshold (3 Mbps).
+- `--intent shrink --target-bitrate 2.5M`: explicit bitrate (suffixes
+  `k`/`M`/`G` accepted), no downscale unless `--max-height` also set.
+
+Bare `--max-height` or `--target-bitrate` (without `--intent`) implies
+shrink. Step 4's earlier features still apply: assess() runs, Issues are
+rendered, the `[Y/n]` prompt fires unless `--yes`, fine-gate refuses Auto
+on already-fine files unless `--force`. Explicit intents (Reencode, Shrink)
+bypass the fine-gate.
 
 ## Requirements
 
@@ -54,6 +61,18 @@ cargo run -- --force --yes already-modern.mkv newname
 
 # Force a re-encode regardless of assessment:
 cargo run -- --yes --reencode old-movie.vob newname
+
+# Shrink: cap bitrate at the per-resolution threshold (DWIM):
+cargo run -- --yes --intent shrink huge-1080p.mkv smaller
+
+# Shrink with downscale to 720p:
+cargo run -- --yes --intent shrink --max-height 720 huge-1080p.mkv smaller
+
+# Shrink with an explicit target bitrate (suffix 'M' = Mbps):
+cargo run -- --yes --intent shrink --target-bitrate 2.5M huge.mkv smaller
+
+# Bare --max-height also implies shrink:
+cargo run -- --yes --max-height 1080 4k-source.mkv smaller-1080p
 
 # Force x265 + MP4, custom CRF, slower preset for better compression:
 cargo run -- --yes --reencode --video-codec x265 --container mp4 \

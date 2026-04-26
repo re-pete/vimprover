@@ -89,8 +89,32 @@ struct FlowFlags {
 }
 
 fn intent_from_args(args: &Args) -> Intent {
+    // Explicit --intent wins. --reencode is a back-compat shortcut for
+    // --intent reencode (clap rejects mixing them, so we don't have to
+    // resolve a conflict here).
+    if let Some(cli_intent) = args.intent {
+        return match cli_intent {
+            cli::CliIntent::Auto => Intent::Auto,
+            cli::CliIntent::Remux => Intent::Remux,
+            cli::CliIntent::Reencode => Intent::Reencode,
+            cli::CliIntent::Shrink => Intent::Shrink {
+                max_height: args.max_height,
+                target_bitrate_bps: args.target_bitrate,
+            },
+        };
+    }
+
+    // No --intent: --reencode forces Reencode, otherwise Auto. If the user
+    // passed --max-height or --target-bitrate without --intent shrink, treat
+    // that as an implicit shrink request (those flags only make sense for
+    // shrink, so accepting them as opt-in is the friendly thing to do).
     if args.reencode {
         Intent::Reencode
+    } else if args.max_height.is_some() || args.target_bitrate.is_some() {
+        Intent::Shrink {
+            max_height: args.max_height,
+            target_bitrate_bps: args.target_bitrate,
+        }
     } else {
         Intent::Auto
     }
@@ -145,7 +169,7 @@ async fn run_single_file(
     println!("{}", format::render_profile(input, &profile));
 
     // 2. Assess + render the Issues block (only when there are issues).
-    let assessment = assess::assess(&profile);
+    let assessment = assess::assess(&profile, &intent);
     if let Some(issues_block) = format::render_assessment(&assessment) {
         println!();
         println!("{issues_block}");

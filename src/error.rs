@@ -51,6 +51,15 @@ pub enum Error {
     #[error("{0} is not yet implemented")]
     Unimplemented(&'static str),
 
+    /// Returned by `Intent::Shrink` planning when the source is already
+    /// at-or-below the target threshold and the user gave no explicit knobs:
+    /// there's literally no smaller file we'd produce. The CLI surfaces this
+    /// as a refusal with a hint about `--target-bitrate` / `--max-height`.
+    #[error(
+        "{0} \u{2014} pass --target-bitrate or --max-height to force a specific shrink target"
+    )]
+    NothingToShrink(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

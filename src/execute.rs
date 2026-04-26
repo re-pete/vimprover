@@ -101,6 +101,20 @@ pub fn build_ffmpeg_args(
             push_pair(&mut args, "-crf", &crf.to_string());
             push_pair(&mut args, "-preset", preset);
         }
+        VideoStrategy::ReencodeX264Abr { target_bps, max_bps, bufsize_bps, preset } => {
+            push_pair(&mut args, "-c:v", "libx264");
+            push_pair(&mut args, "-b:v", target_bps.to_string().as_str());
+            push_pair(&mut args, "-maxrate", max_bps.to_string().as_str());
+            push_pair(&mut args, "-bufsize", bufsize_bps.to_string().as_str());
+            push_pair(&mut args, "-preset", preset);
+        }
+        VideoStrategy::ReencodeX265Abr { target_bps, max_bps, bufsize_bps, preset } => {
+            push_pair(&mut args, "-c:v", "libx265");
+            push_pair(&mut args, "-b:v", target_bps.to_string().as_str());
+            push_pair(&mut args, "-maxrate", max_bps.to_string().as_str());
+            push_pair(&mut args, "-bufsize", bufsize_bps.to_string().as_str());
+            push_pair(&mut args, "-preset", preset);
+        }
     }
 
     // Filters.

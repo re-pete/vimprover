@@ -100,7 +100,10 @@ fn describe_issue(issue: &Issue) -> String {
             format_bitrate(*actual),
             format_bitrate(*threshold)
         ),
-        Issue::ResolutionWasteful => "resolution wasteful for source bitrate".into(),
+        Issue::ResolutionWasteful { height, bits_per_pixel_per_sec } => format!(
+            "resolution wasteful ({height}p at {bits_per_pixel_per_sec:.2} bits/pixel/sec — \
+             downscale won't lose meaningful detail)"
+        ),
         Issue::NonSquarePixels { sar_num, sar_den } => {
             format!("non-square pixels (SAR {sar_num}:{sar_den})")
         }
@@ -159,6 +162,16 @@ fn describe_video(recipe: &EncodeRecipe) -> String {
         ),
         VideoStrategy::ReencodeX265 { crf, preset } => format!(
             "Re-encode video to H.265 (CRF {crf}, {preset} preset) in {}",
+            recipe.output_container
+        ),
+        VideoStrategy::ReencodeX264Abr { target_bps, preset, .. } => format!(
+            "Re-encode video to H.264 (ABR {} target, {preset} preset) in {}",
+            format_bitrate(*target_bps),
+            recipe.output_container
+        ),
+        VideoStrategy::ReencodeX265Abr { target_bps, preset, .. } => format!(
+            "Re-encode video to H.265 (ABR {} target, {preset} preset) in {}",
+            format_bitrate(*target_bps),
             recipe.output_container
         ),
     }

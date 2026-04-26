@@ -73,6 +73,21 @@ pub enum VideoStrategy {
     Copy,
     ReencodeX264 { crf: u8, preset: String },
     ReencodeX265 { crf: u8, preset: String },
+    /// Single-pass average-bitrate (ABR) re-encode for shrink mode. Produces
+    /// `-b:v <target> -maxrate <max> -bufsize <bufsize> -preset <preset>`.
+    /// Output size lands within ~10–20% of `target_bps` for typical content.
+    ReencodeX264Abr {
+        target_bps: u64,
+        max_bps: u64,
+        bufsize_bps: u64,
+        preset: String,
+    },
+    ReencodeX265Abr {
+        target_bps: u64,
+        max_bps: u64,
+        bufsize_bps: u64,
+        preset: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +139,9 @@ pub fn plan(
         }
         Intent::Remux => Ok(plan_remux(profile, overrides)),
         Intent::Reencode => Ok(plan_reencode(profile, overrides)),
-        Intent::Shrink { .. } => Err(Error::Unimplemented(
-            "shrink intent (build-order step 5)",
-        )),
+        Intent::Shrink { max_height, target_bitrate_bps } => {
+            plan_shrink(profile, overrides, *max_height, *target_bitrate_bps)
+        }
         Intent::Concat => Err(Error::Unimplemented(
             "concat intent (build-order step 6)",
         )),
@@ -175,6 +190,132 @@ fn plan_reencode(profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe 
         audio_strategy,
         extra_flags,
     }
+}
+
+/// Build a shrink recipe for `Intent::Shrink`.
+///
+/// Shrink mode always re-encodes (it's never a stream-copy operation) and
+/// always uses single-pass ABR rate control so the output bitrate is
+/// predictable. It picks `target_bps` in this order:
+///
+/// 1. User-supplied `target_bitrate_bps`.
+/// 2. The per-resolution threshold from
+///    [`crate::assess::bitrate_threshold_for_height`] applied to the
+///    *output* height (which is `min(source.height, max_height)`).
+///
+/// Returns [`Error::NothingToShrink`] when the user gave no explicit knob
+/// and the source is already at-or-below the threshold for its height —
+/// re-encoding would produce a same-or-larger file, so refusing is the
+/// honest answer.
+fn plan_shrink(
+    profile: &MediaProfile,
+    overrides: &Overrides,
+    max_height: Option<u32>,
+    target_bitrate_bps: Option<u64>,
+) -> Result<EncodeRecipe> {
+    // Step 1: target output height. Never *up*scale; max_height only caps.
+    let output_height = match max_height {
+        Some(cap) if cap < profile.video.height => cap,
+        _ => profile.video.height,
+    };
+    let downscaling = output_height < profile.video.height;
+
+    // Step 2: target bitrate.
+    let threshold = crate::assess::bitrate_threshold_for_height(output_height);
+    let target_bps = match target_bitrate_bps {
+        Some(explicit) => explicit,
+        None => threshold,
+    };
+
+    // Step 3: refuse if there's literally nothing to shrink — no downscale,
+    // no explicit bitrate target, and source is already at or below the
+    // implicit threshold.
+    if !downscaling
+        && target_bitrate_bps.is_none()
+        && profile.bitrate_bps.is_some_and(|src| src <= threshold)
+    {
+        return Err(Error::NothingToShrink(format!(
+            "source is already {} at {}p (threshold for {}p is {})",
+            crate::format::format_bitrate(profile.bitrate_bps.unwrap()),
+            profile.video.height,
+            output_height,
+            crate::format::format_bitrate(threshold),
+        )));
+    }
+
+    // Step 4: compose the recipe. Most pieces match plan_reencode; only the
+    // video strategy and the (potential) downscale filter differ.
+    let output_container = overrides.container.clone().unwrap_or(Container::Mkv);
+    let preset = overrides
+        .preset
+        .clone()
+        .unwrap_or_else(|| "medium".to_string());
+    let codec = overrides
+        .video_codec
+        .unwrap_or_else(|| default_codec_choice(profile));
+
+    // Single-pass ABR sized so VBV-induced peaks have headroom.
+    let max_bps = target_bps + target_bps / 4; // 1.25×
+    let bufsize_bps = target_bps * 2;          // 2.0×
+
+    let video_strategy = match codec {
+        VideoCodecChoice::X264 => VideoStrategy::ReencodeX264Abr {
+            target_bps,
+            max_bps,
+            bufsize_bps,
+            preset,
+        },
+        VideoCodecChoice::X265 => VideoStrategy::ReencodeX265Abr {
+            target_bps,
+            max_bps,
+            bufsize_bps,
+            preset,
+        },
+    };
+
+    // Filters: start from the reencode set (deinterlace + square-pixel
+    // correction), then prepend a downscale Scale filter when needed.
+    let mut video_filters = select_video_filters(profile);
+    if downscaling {
+        let output_width = scaled_width_preserving_aspect(
+            profile.video.width,
+            profile.video.height,
+            output_height,
+        );
+        // Prepend so the downscale runs before any post-deinterlace filters
+        // (cheaper to deinterlace fewer pixels).
+        video_filters.insert(0, VideoFilter::Scale {
+            width: output_width,
+            height: output_height,
+        });
+    }
+
+    let audio_strategy = select_audio_strategy(profile, overrides);
+    let extra_flags = build_extra_flags(profile, &output_container);
+
+    Ok(EncodeRecipe {
+        output_container,
+        video_strategy,
+        video_filters,
+        audio_strategy,
+        extra_flags,
+    })
+}
+
+/// Compute the width that preserves the source aspect ratio when scaling to
+/// `target_height`. Rounds to even (libx264 / libx265 require dimensions
+/// divisible by 2 in standard 4:2:0 chroma subsampling).
+fn scaled_width_preserving_aspect(
+    src_width: u32,
+    src_height: u32,
+    target_height: u32,
+) -> u32 {
+    if src_height == 0 {
+        return src_width; // pathological; let ffmpeg complain
+    }
+    let scaled = (src_width as u64 * target_height as u64) / src_height as u64;
+    // Round down to nearest even number.
+    (scaled & !1) as u32
 }
 
 fn select_video_strategy(profile: &MediaProfile, overrides: &Overrides) -> VideoStrategy {
@@ -454,6 +595,248 @@ mod tests {
         ));
         // The interlaced sample profile should also pick up the bwdif filter.
         assert!(recipe.video_filters.contains(&VideoFilter::Bwdif));
+    }
+
+    // -- Intent::Shrink ------------------------------------------------------
+
+    /// 1080p H.264/AAC MKV at 12 Mbps — well above the 5 Mbps threshold,
+    /// so an unconfigured shrink should target the threshold.
+    fn oversized_1080p_profile() -> MediaProfile {
+        MediaProfile {
+            container: Container::Mkv,
+            video: VideoInfo {
+                codec: VideoCodec::H264,
+                width: 1920,
+                height: 1080,
+                field_order: FieldOrder::Progressive,
+                framerate: Rational::new(24, 1),
+                pix_fmt: Some(PixFmt::Yuv420p),
+                sar: Rational::new(1, 1),
+                is_hdr: false,
+            },
+            audio: vec![AudioInfo {
+                codec: AudioCodec::Aac,
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                sample_rate_hz: Some(48_000),
+                bitrate_bps: Some(192_000),
+                language: Some("eng".into()),
+            }],
+            duration_secs: Some(60.0),
+            file_size_bytes: Some(90_000_000),
+            bitrate_bps: Some(12_000_000),
+        }
+    }
+
+    #[test]
+    fn shrink_default_targets_threshold_for_source_height() {
+        let p = oversized_1080p_profile();
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink succeeds for oversized 1080p");
+
+        // ABR at the 1080p threshold (5 Mbps), max = 1.25× target,
+        // bufsize = 2× target.
+        match &recipe.video_strategy {
+            VideoStrategy::ReencodeX264Abr {
+                target_bps,
+                max_bps,
+                bufsize_bps,
+                preset,
+            } => {
+                assert_eq!(*target_bps, 5_000_000);
+                assert_eq!(*max_bps, 6_250_000);
+                assert_eq!(*bufsize_bps, 10_000_000);
+                assert_eq!(preset, "medium");
+            }
+            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+        }
+        // No downscale → no Scale filter.
+        assert!(!recipe.video_filters.iter().any(|f| matches!(f, VideoFilter::Scale { .. })));
+    }
+
+    #[test]
+    fn shrink_with_max_height_downscales_and_targets_smaller_threshold() {
+        let p = oversized_1080p_profile();
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: Some(720),
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+
+        // Target should now be the 720p threshold (3 Mbps), not 1080p's.
+        match &recipe.video_strategy {
+            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
+                assert_eq!(*target_bps, 3_000_000);
+            }
+            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+        }
+
+        // Scale filter prepended with width preserving 16:9 aspect:
+        // 1920 × 720 / 1080 = 1280.
+        let scale = recipe
+            .video_filters
+            .iter()
+            .find(|f| matches!(f, VideoFilter::Scale { .. }))
+            .expect("expected Scale filter");
+        assert_eq!(*scale, VideoFilter::Scale { width: 1280, height: 720 });
+    }
+
+    #[test]
+    fn shrink_with_explicit_target_bitrate_uses_it_verbatim() {
+        let p = oversized_1080p_profile();
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: Some(2_500_000), // user wants ~2.5 Mbps
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+
+        match &recipe.video_strategy {
+            VideoStrategy::ReencodeX264Abr {
+                target_bps,
+                max_bps,
+                bufsize_bps,
+                ..
+            } => {
+                assert_eq!(*target_bps, 2_500_000);
+                assert_eq!(*max_bps, 3_125_000);
+                assert_eq!(*bufsize_bps, 5_000_000);
+            }
+            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shrink_refuses_when_source_already_at_or_below_threshold() {
+        let mut p = oversized_1080p_profile();
+        p.bitrate_bps = Some(4_000_000); // below the 5 Mbps threshold
+
+        let result = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        );
+
+        match result {
+            Err(Error::NothingToShrink(msg)) => {
+                assert!(
+                    msg.contains("1080p"),
+                    "error message should mention source resolution: {msg}"
+                );
+            }
+            other => panic!("expected NothingToShrink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shrink_with_explicit_target_proceeds_even_if_source_is_small() {
+        // User explicitly wants a smaller target — we trust them even if
+        // the source is already under the implicit threshold.
+        let mut p = oversized_1080p_profile();
+        p.bitrate_bps = Some(4_000_000);
+
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: Some(1_000_000),
+            },
+            &Overrides::default(),
+        )
+        .expect("explicit target overrides nothing-to-shrink");
+
+        match &recipe.video_strategy {
+            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
+                assert_eq!(*target_bps, 1_000_000);
+            }
+            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shrink_with_max_height_above_source_doesnt_upscale() {
+        // Source is 1080p, user passes --max-height 1440. We should NOT
+        // upscale; we should keep 1080p.
+        let p = oversized_1080p_profile();
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: Some(1440),
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+
+        // No Scale filter (no resolution change).
+        assert!(!recipe.video_filters.iter().any(|f| matches!(f, VideoFilter::Scale { .. })));
+        // Bitrate target stays at 1080p's threshold.
+        match &recipe.video_strategy {
+            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
+                assert_eq!(*target_bps, 5_000_000);
+            }
+            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shrink_picks_x265_for_4k_or_hdr_sources() {
+        // 4K source: default codec is x265. Shrink should respect that.
+        let mut p = oversized_1080p_profile();
+        p.video.width = 3840;
+        p.video.height = 2160;
+        p.bitrate_bps = Some(40_000_000); // 4K @ 40 Mbps; threshold is 15 Mbps
+
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+
+        assert!(matches!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX265Abr { .. }
+        ));
+    }
+
+    #[test]
+    fn scaled_width_preserving_aspect_rounds_to_even() {
+        // Standard 16:9 cases all give even widths.
+        assert_eq!(scaled_width_preserving_aspect(1920, 1080, 720), 1280);
+        assert_eq!(scaled_width_preserving_aspect(3840, 2160, 1080), 1920);
+        assert_eq!(scaled_width_preserving_aspect(1920, 1080, 480), 852);
+
+        // Non-standard aspect that would compute to an odd width:
+        // 1919 × 720 / 1080 = 1279.33 → 1279 → rounded down to 1278.
+        assert_eq!(scaled_width_preserving_aspect(1919, 1080, 720), 1278);
     }
 
     #[test]
