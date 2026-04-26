@@ -23,6 +23,8 @@ use vimprover::model::MediaProfile;
 use vimprover::plan::{self, Intent, Overrides};
 use vimprover::probe;
 
+use crate::cli::Args;
+
 mod cli;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -54,7 +56,46 @@ async fn main() -> Result<()> {
         );
     }
 
-    run_single_file(&inputs[0], &user_output, args.dry_run, args.overwrite).await
+    let intent = intent_from_args(&args);
+    let overrides = overrides_from_args(&args, &user_output);
+
+    run_single_file(
+        &inputs[0],
+        &user_output,
+        intent,
+        overrides,
+        args.dry_run,
+        args.overwrite,
+    )
+    .await
+}
+
+fn intent_from_args(args: &Args) -> Intent {
+    if args.reencode {
+        Intent::Reencode
+    } else {
+        Intent::Auto
+    }
+}
+
+fn overrides_from_args(args: &Args, output_path: &Path) -> Overrides {
+    // Explicit --container wins; otherwise infer from a recognized extension
+    // on the output path (e.g. `out.mp4` → MP4). Per CLAUDE.md: "OUTPUT_NAME
+    // without extension lets the planner pick the container. With extension
+    // forces it."
+    let container = args
+        .container
+        .map(Into::into)
+        .or_else(|| plan::container_from_output_extension(output_path));
+
+    Overrides {
+        container,
+        video_codec: args.video_codec.map(Into::into),
+        crf: args.crf,
+        preset: args.preset.clone(),
+        max_height: None, // wired up in build-order step 5 (shrink)
+        keep_multichannel_audio: args.keep_multichannel_audio,
+    }
 }
 
 async fn run_probe_only(paths: &[PathBuf]) -> Result<()> {
@@ -75,6 +116,8 @@ async fn run_probe_only(paths: &[PathBuf]) -> Result<()> {
 async fn run_single_file(
     input: &Path,
     user_output: &Path,
+    intent: Intent,
+    overrides: Overrides,
     dry_run: bool,
     overwrite: bool,
 ) -> Result<()> {
@@ -86,7 +129,7 @@ async fn run_single_file(
 
     // 2. Plan.
     let assessment = Assessment::default(); // wired up in step 4
-    let recipe = plan::plan(&profile, &assessment, &Intent::Auto, &Overrides::default())
+    let recipe = plan::plan(&profile, &assessment, &intent, &overrides)
         .with_context(|| "planning")?;
 
     // 3. Resolve output path.

@@ -84,6 +84,9 @@ fn collect_plan_lines(recipe: &EncodeRecipe, output: &Path) -> Vec<String> {
         if let Some(audio_line) = describe_audio(&recipe.audio_strategy) {
             lines.push(audio_line);
         }
+        if recipe.extra_flags.windows(2).any(|w| w == ["-color_range", "pc"]) {
+            lines.push("Preserve full-range (JPEG) color tagging".into());
+        }
         if matches!(recipe.output_container, crate::model::Container::Mp4)
             && recipe
                 .extra_flags

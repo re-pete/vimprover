@@ -10,10 +10,12 @@ The full design — including the build order this work follows — lives in
 
 ## Status
 
-**Build-order step 2: single-file remux.** `vimprover INPUT OUTPUT` probes the
-input, plans a stream-copy to Matroska, prints the plan, and runs ffmpeg. The
-`--probe-only` flag preserves step 1's diagnostic mode. The `assess` module and
-the re-encode/shrink/concat paths in `plan` remain stubs for later steps.
+**Build-order step 3: single-file re-encode.** `vimprover --reencode INPUT OUTPUT`
+plans a re-encode (H.264/H.265 with sensible defaults, deinterlace,
+square-pixel correction, AAC audio downmix), prints the plan, and runs
+ffmpeg. The default invocation (no `--reencode`) still stream-copy-remuxes—
+`Intent::Auto` will flip to re-encode automatically once the assessment
+lands in step 4. `--probe-only` preserves step 1's diagnostic mode.
 
 ## Requirements
 
@@ -34,14 +36,22 @@ cargo build --release # optimized
 # Remux a legacy file to MKV (planner picks .mkv since no extension given):
 cargo run -- old-movie.vob newname
 
-# Force a specific extension (may fail if codecs can't live in that container):
-cargo run -- old-movie.wmv newname.mkv
+# Force a re-encode (H.264 by default, with deinterlace + square-pixel fix
+# applied automatically when the source needs them):
+cargo run -- --reencode old-movie.vob newname
+
+# Force x265 + MP4, custom CRF, slower preset for better compression:
+cargo run -- --reencode --video-codec x265 --container mp4 \
+    --crf 22 --preset slow old-movie.vob newname
+
+# Preserve 5.1 audio instead of downmixing to stereo:
+cargo run -- --reencode --keep-multichannel-audio dvd-rip.vob newname
 
 # Just print the probe summary (step-1 functionality):
 cargo run -- --probe-only some-movie.mkv
 
 # Print the plan and exact ffmpeg command, but don't run it:
-cargo run -- --dry-run old-movie.vob newname
+cargo run -- --dry-run --reencode old-movie.vob newname
 
 # Overwrite an existing output file:
 cargo run -- --overwrite old-movie.vob newname
@@ -90,13 +100,13 @@ missing.
 src/
 ├── lib.rs       # crate root; declares the modules below
 ├── main.rs      # binary entry point (probe → plan → render → execute)
-├── cli.rs       # clap Args (binary-only)
+├── cli.rs       # clap Args + value enums (binary-only)
 ├── error.rs     # typed Error / Result
 ├── model.rs     # MediaProfile, VideoInfo, codec/container/pixfmt enums
 ├── probe.rs     # ffprobe runner + JSON → MediaProfile
 ├── format.rs    # human-readable rendering of profiles & recipes
 ├── assess.rs    # "is this file fine?" (stub; step 4)
-├── plan.rs      # MediaProfile → EncodeRecipe (remux implemented; re-encode/shrink/concat stubbed)
+├── plan.rs      # MediaProfile → EncodeRecipe (remux + re-encode; shrink/concat stubbed)
 └── execute.rs   # build ffmpeg argv, run it, surface errors
 
 tests/

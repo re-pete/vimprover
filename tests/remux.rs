@@ -61,6 +61,47 @@ fn synthesize_divx_avi(out: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Generate a tiny interlaced MPEG-2 program-stream with non-square pixels —
+/// the canonical "DVD-shaped" input that exercises both deinterlace and
+/// square-pixel correction in the re-encode planner.
+fn synthesize_interlaced_mpeg2_ps(out: &Path) -> bool {
+    Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=720x480:rate=30000/1001",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "mpeg2video",
+            "-flags",
+            "+ildct+ilme",
+            "-top",
+            "1",
+            "-aspect",
+            "4:3",
+            "-b:v",
+            "800k",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "192k",
+            "-f",
+            "vob",
+        ])
+        .arg(out)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Generate a small MPEG program-stream file that looks like a DVD VOB:
 /// MPEG-2 video + AC-3 audio in an MPEG-PS container.
 fn synthesize_mpeg_ps(out: &Path) -> bool {
@@ -221,6 +262,143 @@ fn refuses_to_overwrite_existing_output_without_flag() {
     // Sanity: existing file is untouched.
     let body = std::fs::read(&output).expect("read existing");
     assert_eq!(body, b"existing contents");
+}
+
+/// `--reencode` end-to-end on an interlaced MPEG-2 / MPEG-PS source. Verifies
+/// that the planner picks H.264 + bwdif and produces a progressive H.264 MKV.
+#[test]
+fn reencodes_interlaced_mpeg2_to_progressive_h264() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("input.vob");
+    let output_stem = dir.path().join("out");
+    let expected_output = dir.path().join("out.mkv");
+
+    assert!(
+        synthesize_interlaced_mpeg2_ps(&input),
+        "synthesize interlaced MPEG-PS source"
+    );
+
+    let result = Command::new(vimprover_bin())
+        .arg("--reencode")
+        .arg(&input)
+        .arg(&output_stem)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover --reencode failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("Re-encode video to H.264"),
+        "expected H.264 re-encode plan:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Deinterlace with bwdif"),
+        "expected deinterlace step in plan:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Set square pixel aspect ratio"),
+        "expected square-pixel correction step in plan:\n{stdout}"
+    );
+    assert!(expected_output.exists(), "no output file");
+
+    // ffprobe the output and verify codec + field order.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,field_order",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&expected_output)
+        .output()
+        .expect("spawn ffprobe");
+    let probe_str = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_str.contains("codec_name=h264"),
+        "expected H.264 in output:\n{probe_str}"
+    );
+    assert!(
+        probe_str.contains("field_order=progressive"),
+        "expected progressive output:\n{probe_str}"
+    );
+}
+
+/// Forcing x265 + MP4 + custom CRF should round-trip cleanly to a valid file.
+#[test]
+fn reencode_x265_to_mp4_works() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("input.vob");
+    let output_stem = dir.path().join("out");
+    let expected_output = dir.path().join("out.mp4");
+
+    assert!(synthesize_mpeg_ps(&input));
+
+    let result = Command::new(vimprover_bin())
+        .arg("--reencode")
+        .arg("--video-codec")
+        .arg("x265")
+        .arg("--container")
+        .arg("mp4")
+        .arg("--crf")
+        .arg("30") // crank speed up for the test
+        .arg("--preset")
+        .arg("ultrafast")
+        .arg(&input)
+        .arg(&output_stem)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover failed: status={:?}\nstderr:\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr),
+    );
+    assert!(expected_output.exists());
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name:format=format_name",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&expected_output)
+        .output()
+        .expect("spawn ffprobe");
+    let probe_str = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_str.contains("codec_name=hevc"),
+        "expected HEVC video codec:\n{probe_str}"
+    );
+    // ISO-BMFF MP4 reports as `mov,mp4,m4a,3gp,3g2,mj2`.
+    assert!(
+        probe_str.contains("mp4"),
+        "expected MP4 container:\n{probe_str}"
+    );
 }
 
 /// Regression: AVI carrying MPEG-4 ASP (Xvid/DivX) with B-frames hits
