@@ -1,22 +1,27 @@
 //! `vimprover` binary entry point.
 //!
-//! Build-order step 2 wires together the full pipeline that exists today:
+//! Step 4 wiring:
 //!
 //! 1. Parse CLI args.
-//! 2. Decide between `--probe-only` mode and the normal `INPUT... OUTPUT` flow.
-//! 3. For each input: run [`vimprover::probe::probe_file`] and print the profile.
-//! 4. Plan a recipe via [`vimprover::plan::plan`] (Auto intent for now).
-//! 5. Resolve the output path, render the plan, optionally print the exact
-//!    ffmpeg command line.
-//! 6. Unless `--dry-run`, run [`vimprover::execute::run_recipe`].
+//! 2. `--probe-only` short-circuit prints just the probe and exits.
+//! 3. Probe the input → print the profile.
+//! 4. [`vimprover::assess::assess`] → print the `Issues:` block (if any).
+//! 5. **Fine-gate**: in `Intent::Auto` mode, refuse fine files unless
+//!    `--force` was passed.
+//! 6. [`vimprover::plan::plan`] → render the plan.
+//! 7. `--dry-run` short-circuits with the exact ffmpeg command and exits.
+//! 8. **Confirmation prompt** (unless `--yes`): ask `[Y/n]` and require
+//!    `--yes` for non-TTY stdin.
+//! 9. Execute via [`vimprover::execute::run_recipe`].
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use vimprover::assess::Assessment;
+use vimprover::assess;
 use vimprover::execute;
 use vimprover::format;
 use vimprover::model::MediaProfile;
@@ -64,10 +69,23 @@ async fn main() -> Result<()> {
         &user_output,
         intent,
         overrides,
-        args.dry_run,
-        args.overwrite,
+        FlowFlags {
+            dry_run: args.dry_run,
+            overwrite: args.overwrite,
+            force: args.force,
+            yes: args.yes,
+        },
     )
     .await
+}
+
+/// Bundle of per-invocation flow-control flags so `run_single_file` doesn't
+/// take a parameter list a mile long.
+struct FlowFlags {
+    dry_run: bool,
+    overwrite: bool,
+    force: bool,
+    yes: bool,
 }
 
 fn intent_from_args(args: &Args) -> Intent {
@@ -118,8 +136,7 @@ async fn run_single_file(
     user_output: &Path,
     intent: Intent,
     overrides: Overrides,
-    dry_run: bool,
-    overwrite: bool,
+    flags: FlowFlags,
 ) -> Result<()> {
     // 1. Probe.
     let profile: MediaProfile = probe::probe_file(input)
@@ -127,27 +144,42 @@ async fn run_single_file(
         .with_context(|| format!("probing {}", input.display()))?;
     println!("{}", format::render_profile(input, &profile));
 
-    // 2. Plan.
-    let assessment = Assessment::default(); // wired up in step 4
+    // 2. Assess + render the Issues block (only when there are issues).
+    let assessment = assess::assess(&profile);
+    if let Some(issues_block) = format::render_assessment(&assessment) {
+        println!();
+        println!("{issues_block}");
+    }
+
+    // 3. Fine-gate. Only `Intent::Auto` is gated; explicit intents
+    //    (Reencode, Remux, etc.) bypass this check entirely.
+    if matches!(intent, Intent::Auto) && assessment.is_fine() && !flags.force {
+        println!();
+        bail!(
+            "{} is already fine — pass --force to process anyway, \
+             or use --reencode / --intent for an explicit action.",
+            input.display()
+        );
+    }
+
+    // 4. Plan.
     let recipe = plan::plan(&profile, &assessment, &intent, &overrides)
         .with_context(|| "planning")?;
 
-    // 3. Resolve output path.
+    // 5. Resolve output path + render the plan.
     let output = plan::resolve_output_path(user_output, &recipe);
-
-    // 4. Render the plan.
     println!();
     println!("{}", format::render_recipe(&recipe, &output));
 
-    // 5. Dry-run short-circuit: render the exact ffmpeg command and exit.
-    if dry_run {
+    // 6. Dry-run short-circuit: render the exact ffmpeg command and exit.
+    if flags.dry_run {
         let ffmpeg = execute::locate_ffmpeg()?;
         let argv = execute::build_ffmpeg_args(
             &[input],
             std::slice::from_ref(&profile.container),
             &output,
             &recipe,
-            overwrite,
+            flags.overwrite,
         );
         println!();
         println!("Command:   {}", execute::render_command(&ffmpeg, &argv));
@@ -156,7 +188,13 @@ async fn run_single_file(
         return Ok(());
     }
 
-    // 6. Execute.
+    // 7. Confirmation prompt (unless --yes).
+    if !flags.yes && !confirm_proceed()? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // 8. Execute.
     println!();
     println!("Running ffmpeg…");
     execute::run_recipe(
@@ -164,13 +202,46 @@ async fn run_single_file(
         std::slice::from_ref(&profile.container),
         &output,
         &recipe,
-        overwrite,
+        flags.overwrite,
     )
     .await
     .with_context(|| format!("encoding to {}", output.display()))?;
 
     println!("Done. Wrote {}.", output.display());
     Ok(())
+}
+
+/// Show a `[Y/n]` prompt and return whether the user accepted.
+///
+/// - Default (empty input) is "yes".
+/// - Non-TTY stdin returns an error: batch scripts must pass `--yes`
+///   explicitly so the user opts into non-interactive runs.
+/// - Any input starting with `y`/`Y` is yes; `n`/`N` is no; everything
+///   else falls back to the default.
+fn confirm_proceed() -> Result<bool> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        bail!(
+            "stdin is not a terminal; pass --yes to skip the confirmation prompt \
+             in non-interactive runs"
+        );
+    }
+
+    print!("\nProceed? [Y/n] ");
+    std::io::stdout().flush().ok();
+
+    let mut buf = String::new();
+    stdin
+        .lock()
+        .read_line(&mut buf)
+        .context("reading confirmation from stdin")?;
+
+    Ok(match buf.trim().chars().next() {
+        None => true,                 // bare Enter = default yes
+        Some('y' | 'Y') => true,
+        Some('n' | 'N') => false,
+        _ => true,                    // anything else: default yes
+    })
 }
 
 fn init_tracing() {

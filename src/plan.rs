@@ -103,16 +103,26 @@ pub struct EncodeRecipe {
 
 /// Build an [`EncodeRecipe`] from a profile, assessment, and user intent.
 ///
-/// Only [`Intent::Auto`] and [`Intent::Remux`] are implemented in build-order
-/// step 2; other intents return [`Error::Unimplemented`].
+/// `Intent::Auto` consults the assessment: if any issue requires a re-encode
+/// (per [`Assessment::requires_reencode`]), it routes to `plan_reencode`;
+/// otherwise it routes to `plan_remux` (sufficient for container-only fixes).
+/// Explicit intents (`Remux`, `Reencode`) bypass the assessment and do exactly
+/// what was asked.
 pub fn plan(
     profile: &MediaProfile,
-    _assessment: &Assessment,
+    assessment: &Assessment,
     intent: &Intent,
     overrides: &Overrides,
 ) -> Result<EncodeRecipe> {
     match intent {
-        Intent::Auto | Intent::Remux => Ok(plan_remux(profile, overrides)),
+        Intent::Auto => {
+            if assessment.requires_reencode() {
+                Ok(plan_reencode(profile, overrides))
+            } else {
+                Ok(plan_remux(profile, overrides))
+            }
+        }
+        Intent::Remux => Ok(plan_remux(profile, overrides)),
         Intent::Reencode => Ok(plan_reencode(profile, overrides)),
         Intent::Shrink { .. } => Err(Error::Unimplemented(
             "shrink intent (build-order step 5)",
@@ -405,7 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_intent_plans_mkv_remux() {
+    fn auto_intent_with_empty_assessment_plans_mkv_remux() {
+        // Default-empty Assessment ⇒ requires_reencode() is false ⇒ remux.
+        // (`sample_profile()` itself has issues, but the caller didn't run
+        // `assess()`; we honor what they passed.)
         let p = sample_profile();
         let recipe = plan(&p, &Assessment::default(), &Intent::Auto, &Overrides::default())
             .expect("plan succeeds for Auto");
@@ -414,6 +427,33 @@ mod tests {
         assert_eq!(recipe.audio_strategy, AudioStrategy::Copy);
         assert!(recipe.video_filters.is_empty());
         assert!(recipe.extra_flags.is_empty());
+    }
+
+    #[test]
+    fn auto_intent_with_remux_only_issue_picks_remux() {
+        let p = sample_profile();
+        let assessment = Assessment {
+            issues: vec![crate::assess::Issue::LegacyContainer(Container::MpegPs)],
+        };
+        let recipe = plan(&p, &assessment, &Intent::Auto, &Overrides::default())
+            .expect("plan succeeds for Auto");
+        assert_eq!(recipe.video_strategy, VideoStrategy::Copy);
+    }
+
+    #[test]
+    fn auto_intent_with_reencode_required_issue_picks_reencode() {
+        let p = sample_profile();
+        let assessment = Assessment {
+            issues: vec![crate::assess::Issue::Interlaced],
+        };
+        let recipe = plan(&p, &assessment, &Intent::Auto, &Overrides::default())
+            .expect("plan succeeds for Auto");
+        assert!(matches!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX264 { .. }
+        ));
+        // The interlaced sample profile should also pick up the bwdif filter.
+        assert!(recipe.video_filters.contains(&VideoFilter::Bwdif));
     }
 
     #[test]

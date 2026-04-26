@@ -32,7 +32,7 @@ pub struct Args {
         short = 'p',
         long,
         conflicts_with_all = [
-            "dry_run", "overwrite", "reencode",
+            "dry_run", "overwrite", "reencode", "force", "yes",
             "video_codec", "crf", "preset",
             "container", "keep_multichannel_audio",
         ],
@@ -44,11 +44,23 @@ pub struct Args {
     pub dry_run: bool,
 
     /// Overwrite the output file if it already exists.
-    #[arg(short = 'f', long)]
+    #[arg(long)]
     pub overwrite: bool,
 
-    /// Force a re-encode even when stream-copy would work. Without this flag,
-    /// vimprover currently always remuxes; step 4 will add automatic detection.
+    /// Process the input even if assessment reports it as already fine.
+    /// Without `--force`, vimprover refuses fine files in `Auto` intent mode.
+    /// Explicit `--reencode` already implies forcing, so `--force` is redundant
+    /// (but harmless) when combined with it.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Skip the interactive `[Y/n]` confirmation prompt and proceed directly.
+    /// Required for non-interactive use (CI, batch scripts).
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
+    /// Force a re-encode even when stream-copy would work. Implies `--force`
+    /// (you're explicitly asking for work even if the file is fine).
     #[arg(short = 'r', long)]
     pub reencode: bool,
 

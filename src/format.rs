@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::assess::{Assessment, Issue};
 use crate::model::{AudioInfo, MediaProfile, Rational, VideoInfo};
 use crate::plan::{AudioStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
 
@@ -53,15 +54,60 @@ pub fn render_profile(path: &Path, profile: &MediaProfile) -> String {
 /// starts with `Plan:` and subsequent lines indent under the value column.
 pub fn render_recipe(recipe: &EncodeRecipe, output: &Path) -> String {
     let lines = collect_plan_lines(recipe, output);
+    render_aligned_block("Plan:", &lines)
+}
+
+/// Render an assessment as a single "Issues:" block, or `None` if the file
+/// is fine. Matches the column alignment of [`render_profile`] and
+/// [`render_recipe`].
+pub fn render_assessment(assessment: &Assessment) -> Option<String> {
+    if assessment.is_fine() {
+        return None;
+    }
+    let lines: Vec<String> = assessment.issues.iter().map(describe_issue).collect();
+    Some(render_aligned_block("Issues:", &lines))
+}
+
+/// Shared block-renderer for the "Field:    value" multi-line shape.
+fn render_aligned_block(label: &str, lines: &[String]) -> String {
+    // Pad the label to the same column width as render_profile uses
+    // ("File:      " = 11 chars, label + spaces).
+    const WIDTH: usize = 11;
+    let pad_label = format!("{label}{:width$}", "", width = WIDTH.saturating_sub(label.len()));
+    let indent = " ".repeat(WIDTH);
+
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
-            let _ = write!(out, "Plan:      {line}");
+            let _ = write!(out, "{pad_label}{line}");
         } else {
-            let _ = write!(out, "\n           {line}");
+            let _ = write!(out, "\n{indent}{line}");
         }
     }
     out
+}
+
+fn describe_issue(issue: &Issue) -> String {
+    match issue {
+        Issue::LegacyVideoCodec(c) => format!("legacy video codec ({c})"),
+        Issue::LegacyAudioCodec(c) => format!("legacy audio codec ({c})"),
+        Issue::LegacyContainer(c) => format!("legacy container ({c})"),
+        Issue::MissingSeekIndex => "missing seek index".into(),
+        Issue::Interlaced => "interlaced source".into(),
+        Issue::NonModernPixelFormat(pf) => format!("non-modern pixel format ({pf})"),
+        Issue::BitrateExcessive { actual, threshold } => format!(
+            "bitrate {} exceeds threshold {}",
+            format_bitrate(*actual),
+            format_bitrate(*threshold)
+        ),
+        Issue::ResolutionWasteful => "resolution wasteful for source bitrate".into(),
+        Issue::NonSquarePixels { sar_num, sar_den } => {
+            format!("non-square pixels (SAR {sar_num}:{sar_den})")
+        }
+        Issue::AudioCodecIncompatibleWithTargetContainer => {
+            "audio codec not supported by target container".into()
+        }
+    }
 }
 
 fn collect_plan_lines(recipe: &EncodeRecipe, output: &Path) -> Vec<String> {
@@ -383,6 +429,29 @@ mod tests {
         assert!(out.contains("Downmix audio to AAC stereo 192 kbps"));
         assert!(out.contains("Enable MP4 faststart"));
         assert!(out.ends_with("Output: /tmp/newname.mp4"));
+    }
+
+    #[test]
+    fn renders_assessment_with_multiple_issues() {
+        let assessment = Assessment {
+            issues: vec![
+                Issue::LegacyVideoCodec(VideoCodec::Mpeg2),
+                Issue::LegacyContainer(Container::MpegPs),
+                Issue::Interlaced,
+                Issue::NonSquarePixels { sar_num: 10, sar_den: 11 },
+            ],
+        };
+        let rendered = render_assessment(&assessment).expect("non-fine -> Some");
+        let expected = "Issues:    legacy video codec (MPEG-2)\n\
+                        \x20          legacy container (MPEG-PS)\n\
+                        \x20          interlaced source\n\
+                        \x20          non-square pixels (SAR 10:11)";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn renders_assessment_returns_none_when_fine() {
+        assert_eq!(render_assessment(&Assessment::default()), None);
     }
 
     #[test]
