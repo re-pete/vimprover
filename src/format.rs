@@ -1,12 +1,13 @@
 //! Human-readable rendering of pipeline artifacts.
 //!
-//! For step 1 this only renders a [`MediaProfile`]. Recipe rendering (for the
-//! interactive Y/N prompt) will live here once [`crate::plan`] is implemented.
+//! Step 1 added [`render_profile`]. Step 2 adds [`render_recipe`] for the
+//! plan-summary block printed before ffmpeg runs.
 
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::model::{AudioInfo, MediaProfile, Rational, VideoInfo};
+use crate::plan::{AudioStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
 
 /// Produce the human-readable "Input:" block for a single file.
 pub fn render_profile(path: &Path, profile: &MediaProfile) -> String {
@@ -44,6 +45,100 @@ pub fn render_profile(path: &Path, profile: &MediaProfile) -> String {
         out.pop();
     }
     out
+}
+
+/// Render a plan-summary block describing what `recipe` will do.
+///
+/// Output uses the same column alignment as [`render_profile`]: the first line
+/// starts with `Plan:` and subsequent lines indent under the value column.
+pub fn render_recipe(recipe: &EncodeRecipe, output: &Path) -> String {
+    let lines = collect_plan_lines(recipe, output);
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            let _ = write!(out, "Plan:      {line}");
+        } else {
+            let _ = write!(out, "\n           {line}");
+        }
+    }
+    out
+}
+
+fn collect_plan_lines(recipe: &EncodeRecipe, output: &Path) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    let pure_copy = matches!(recipe.video_strategy, VideoStrategy::Copy)
+        && matches!(recipe.audio_strategy, AudioStrategy::Copy)
+        && recipe.video_filters.is_empty();
+
+    if pure_copy {
+        lines.push(format!(
+            "Remux to {} (stream copy, no re-encode)",
+            recipe.output_container
+        ));
+    } else {
+        lines.push(describe_video(recipe));
+        for filter in &recipe.video_filters {
+            lines.push(describe_filter(filter));
+        }
+        if let Some(audio_line) = describe_audio(&recipe.audio_strategy) {
+            lines.push(audio_line);
+        }
+        if matches!(recipe.output_container, crate::model::Container::Mp4)
+            && recipe
+                .extra_flags
+                .iter()
+                .any(|f| f == "-movflags" || f == "+faststart")
+        {
+            lines.push("Enable MP4 faststart (moov before mdat)".into());
+        }
+    }
+
+    lines.push(format!("Output: {}", output.display()));
+    lines
+}
+
+fn describe_video(recipe: &EncodeRecipe) -> String {
+    match &recipe.video_strategy {
+        VideoStrategy::Copy => format!(
+            "Container → {} (video stream-copy)",
+            recipe.output_container
+        ),
+        VideoStrategy::ReencodeX264 { crf, preset } => format!(
+            "Re-encode video to H.264 (CRF {crf}, {preset} preset) in {}",
+            recipe.output_container
+        ),
+        VideoStrategy::ReencodeX265 { crf, preset } => format!(
+            "Re-encode video to H.265 (CRF {crf}, {preset} preset) in {}",
+            recipe.output_container
+        ),
+    }
+}
+
+fn describe_filter(f: &VideoFilter) -> String {
+    match f {
+        VideoFilter::Bwdif => "Deinterlace with bwdif".into(),
+        VideoFilter::FieldmatchDecimate => {
+            "Inverse-telecine (fieldmatch + decimate)".into()
+        }
+        VideoFilter::Scale { width, height } => format!("Scale to {width}x{height}"),
+        VideoFilter::SetSar { num: 1, den: 1 } => "Set square pixel aspect ratio".into(),
+        VideoFilter::SetSar { num, den } => format!("Set SAR to {num}:{den}"),
+    }
+}
+
+fn describe_audio(strategy: &AudioStrategy) -> Option<String> {
+    match strategy {
+        AudioStrategy::Copy => None,
+        AudioStrategy::AacStereo { bitrate_bps } => Some(format!(
+            "Downmix audio to AAC stereo {} kbps",
+            bitrate_bps / 1000
+        )),
+        AudioStrategy::AacMultichannel { bitrate_bps } => Some(format!(
+            "Re-encode audio to AAC multichannel ({} kbps)",
+            bitrate_bps / 1000
+        )),
+    }
 }
 
 fn render_video(v: &VideoInfo) -> String {
@@ -238,6 +333,53 @@ mod tests {
                         Video:     MPEG-2, 720x480 (display 655x480), interlaced (TFF), 29.970 fps, yuv420p, SAR 10:11\n\
                         Audio 1:   AC-3, 5.1(side), 48 kHz, 448 kbps (eng)";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn renders_recipe_for_pure_remux() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mkv,
+            video_strategy: VideoStrategy::Copy,
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: Vec::new(),
+        };
+        let out = render_recipe(&recipe, Path::new("newname.mkv"));
+        let expected = "Plan:      Remux to Matroska (MKV) (stream copy, no re-encode)\n\
+                        \x20          Output: newname.mkv";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn renders_recipe_with_filters_and_reencode() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mp4,
+            video_strategy: VideoStrategy::ReencodeX264 {
+                crf: 20,
+                preset: "medium".into(),
+            },
+            video_filters: vec![
+                VideoFilter::Bwdif,
+                VideoFilter::Scale {
+                    width: 854,
+                    height: 480,
+                },
+                VideoFilter::SetSar { num: 1, den: 1 },
+            ],
+            audio_strategy: AudioStrategy::AacStereo { bitrate_bps: 192_000 },
+            extra_flags: vec!["-movflags".into(), "+faststart".into()],
+        };
+        let out = render_recipe(&recipe, Path::new("/tmp/newname.mp4"));
+        assert!(
+            out.starts_with("Plan:      Re-encode video to H.264 (CRF 20, medium preset) in MP4"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("Deinterlace with bwdif"));
+        assert!(out.contains("Scale to 854x480"));
+        assert!(out.contains("Set square pixel aspect ratio"));
+        assert!(out.contains("Downmix audio to AAC stereo 192 kbps"));
+        assert!(out.contains("Enable MP4 faststart"));
+        assert!(out.ends_with("Output: /tmp/newname.mp4"));
     }
 
     #[test]

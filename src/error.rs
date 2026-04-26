@@ -42,6 +42,15 @@ pub enum Error {
     #[error("ffprobe reported no video stream for {0}")]
     NoVideoStream(PathBuf),
 
+    #[error("output file already exists: {0} (pass --overwrite to replace)")]
+    OutputExists(PathBuf),
+
+    #[error("ffmpeg failed (exit {status}); see the output above for details")]
+    FfmpegFailed { status: i32 },
+
+    #[error("{0} is not yet implemented")]
+    Unimplemented(&'static str),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -29,6 +29,7 @@ which = "7"
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

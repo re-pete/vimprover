@@ -1,13 +1,27 @@
 //! `vimprover` binary entry point.
 //!
-//! Today this is a thin wrapper around [`vimprover::probe::probe_file`]: it
-//! parses CLI args, sets up logging, probes each input, and prints the result.
+//! Build-order step 2 wires together the full pipeline that exists today:
+//!
+//! 1. Parse CLI args.
+//! 2. Decide between `--probe-only` mode and the normal `INPUT... OUTPUT` flow.
+//! 3. For each input: run [`vimprover::probe::probe_file`] and print the profile.
+//! 4. Plan a recipe via [`vimprover::plan::plan`] (Auto intent for now).
+//! 5. Resolve the output path, render the plan, optionally print the exact
+//!    ffmpeg command line.
+//! 6. Unless `--dry-run`, run [`vimprover::execute::run_recipe`].
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use vimprover::{format, probe};
+use vimprover::assess::Assessment;
+use vimprover::execute;
+use vimprover::format;
+use vimprover::model::MediaProfile;
+use vimprover::plan::{self, Intent, Overrides};
+use vimprover::probe;
 
 mod cli;
 
@@ -17,19 +31,102 @@ async fn main() -> Result<()> {
 
     let args = cli::Args::parse();
 
-    let mut first = true;
-    for input in &args.inputs {
-        if !first {
-            println!();
-        }
-        first = false;
-
-        let profile = probe::probe_file(input)
-            .await
-            .with_context(|| format!("probing {}", input.display()))?;
-        println!("{}", format::render_profile(input, &profile));
+    if args.probe_only {
+        return run_probe_only(&args.paths).await;
     }
 
+    if args.paths.len() < 2 {
+        bail!(
+            "expected `INPUT [INPUT...] OUTPUT` (got {} path{})",
+            args.paths.len(),
+            if args.paths.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    let mut paths = args.paths.clone();
+    let user_output = paths.pop().expect("checked len >= 2");
+    let inputs = paths;
+
+    if inputs.len() > 1 {
+        bail!(
+            "concat mode (multiple inputs) is not implemented yet \
+             — coming in build-order step 6"
+        );
+    }
+
+    run_single_file(&inputs[0], &user_output, args.dry_run, args.overwrite).await
+}
+
+async fn run_probe_only(paths: &[PathBuf]) -> Result<()> {
+    if paths.len() != 1 {
+        bail!(
+            "--probe-only takes exactly one INPUT (got {})",
+            paths.len()
+        );
+    }
+    let path = &paths[0];
+    let profile = probe::probe_file(path)
+        .await
+        .with_context(|| format!("probing {}", path.display()))?;
+    println!("{}", format::render_profile(path, &profile));
+    Ok(())
+}
+
+async fn run_single_file(
+    input: &Path,
+    user_output: &Path,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<()> {
+    // 1. Probe.
+    let profile: MediaProfile = probe::probe_file(input)
+        .await
+        .with_context(|| format!("probing {}", input.display()))?;
+    println!("{}", format::render_profile(input, &profile));
+
+    // 2. Plan.
+    let assessment = Assessment::default(); // wired up in step 4
+    let recipe = plan::plan(&profile, &assessment, &Intent::Auto, &Overrides::default())
+        .with_context(|| "planning")?;
+
+    // 3. Resolve output path.
+    let output = plan::resolve_output_path(user_output, &recipe);
+
+    // 4. Render the plan.
+    println!();
+    println!("{}", format::render_recipe(&recipe, &output));
+
+    // 5. Dry-run short-circuit: render the exact ffmpeg command and exit.
+    if dry_run {
+        let ffmpeg = execute::locate_ffmpeg()?;
+        let argv = execute::build_ffmpeg_args(
+            &[input],
+            std::slice::from_ref(&profile.container),
+            &output,
+            &recipe,
+            overwrite,
+        );
+        println!();
+        println!("Command:   {}", execute::render_command(&ffmpeg, &argv));
+        println!();
+        println!("(dry run — not executing)");
+        return Ok(());
+    }
+
+    // 6. Execute.
+    println!();
+    println!("Running ffmpeg…");
+    execute::run_recipe(
+        &[input],
+        std::slice::from_ref(&profile.container),
+        &output,
+        &recipe,
+        overwrite,
+    )
+    .await
+    .with_context(|| format!("encoding to {}", output.display()))?;
+
+    println!("Done. Wrote {}.", output.display());
     Ok(())
 }
 

@@ -77,6 +77,22 @@ impl Container {
             (c, _) => c,
         }
     }
+
+    /// Canonical filename extension used when the planner picks this container.
+    pub fn canonical_extension(&self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Mov => "mov",
+            Container::Mkv => "mkv",
+            Container::WebM => "webm",
+            Container::MpegPs => "mpg",
+            Container::MpegTs => "ts",
+            Container::Asf => "wmv",
+            Container::Avi => "avi",
+            Container::Flv => "flv",
+            Container::Unknown(_) => "bin",
+        }
+    }
 }
 
 impl fmt::Display for Container {
