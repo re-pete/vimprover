@@ -611,8 +611,8 @@ fn fine_file_is_rejected_without_force_and_processes_with_force() {
 }
 
 /// Step-5: `--intent shrink --max-height 720` on a 1080p source should
-/// downscale to 720p, ABR-encode at the 720p threshold (3 Mbps target), and
-/// produce an MKV. Bypasses the fine-gate (explicit intent).
+/// downscale to 720p, CRF-encode with x265 (shrink defaults), and produce
+/// an MKV. Bypasses the fine-gate (explicit intent).
 #[test]
 fn shrink_with_max_height_downscales_1080p_to_720p() {
     if !ffmpeg_available() {
@@ -652,8 +652,12 @@ fn shrink_with_max_height_downscales_1080p_to_720p() {
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(
-        stdout.contains("ABR 3.0 Mbps target"),
-        "plan should target the 720p ABR threshold (3 Mbps): \n{stdout}"
+        stdout.contains("Re-encode video to H.265"),
+        "plan should use x265 (shrink default): \n{stdout}"
+    );
+    assert!(
+        stdout.contains("CRF 24"),
+        "plan should use the x265 ≤720p CRF default (24): \n{stdout}"
     );
     assert!(
         stdout.contains("Scale to 1280x720"),
@@ -665,7 +669,7 @@ fn shrink_with_max_height_downscales_1080p_to_720p() {
         expected_output.display()
     );
 
-    // Probe the output and confirm it's actually 720p H.264 in MKV.
+    // Probe the output and confirm it's actually 720p HEVC in MKV.
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -682,8 +686,8 @@ fn shrink_with_max_height_downscales_1080p_to_720p() {
         .expect("spawn ffprobe");
     let probe_str = String::from_utf8_lossy(&probe.stdout);
     assert!(
-        probe_str.contains("codec_name=h264"),
-        "expected H.264 video codec in output:\n{probe_str}"
+        probe_str.contains("codec_name=hevc"),
+        "expected HEVC/H.265 video codec in output:\n{probe_str}"
     );
     assert!(
         probe_str.contains("height=720"),

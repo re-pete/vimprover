@@ -218,17 +218,33 @@ fn plan_reencode(profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe 
 
 /// Build a shrink recipe for `Intent::Shrink`.
 ///
-/// Shrink mode always re-encodes (it's never a stream-copy operation) and
-/// always uses single-pass ABR rate control so the output bitrate is
-/// predictable. It picks `target_bps` in this order:
+/// Shrink mode always re-encodes (it's never a stream-copy operation). The
+/// defaults track what an experienced ffmpeg user would type by hand for an
+/// archival "make this file smaller without losing visible quality" job:
 ///
-/// 1. User-supplied `target_bitrate_bps`.
-/// 2. The per-resolution threshold from
-///    [`crate::assess::bitrate_threshold_for_height`] applied to the
-///    *output* height (which is `min(source.height, max_height)`).
+/// - **Codec:** x265 unconditionally (overridable via `--codec`). Produces
+///   ~25–50 % smaller files than x264 at the same perceptual quality.
+/// - **Preset:** `slow` (overridable via `--preset`). The user explicitly
+///   asked to shrink, so spending CPU for a meaningfully smaller file is
+///   the right tradeoff; x265 in particular gains noticeably over `medium`.
+/// - **Rate control:**
+///   - No `--target-bitrate` → CRF (best quality-per-bit). CRF picked from
+///     [`shrink_default_crf`], a per-codec/per-height table tuned for
+///     "visually indistinguishable from source." Overridable via `--crf`.
+///   - With `--target-bitrate` → single-pass ABR sized with 1.25× max-rate
+///     and 2.0× VBV bufsize. Use when output size must be predictable.
+/// - **Audio:** stream-copy when the output container natively and reliably
+///   accepts the source codec (e.g. AAC in MP4, anything in MKV). When the
+///   container would reject it or accept it compat-sketchily (e.g. AC-3 in
+///   MP4), fall back to AAC via the same policy the reencode planner uses.
+///   Audio is small relative to video, so copy-where-possible is almost
+///   always the right call.
+///
+/// `output_height = min(source.height, max_height)`; when smaller than the
+/// source, a leading `scale=W:H` filter is prepended.
 ///
 /// Returns [`Error::NothingToShrink`] when the user gave no explicit knob
-/// and the source is already at-or-below the threshold for its height —
+/// and the source is already at-or-below the per-height bitrate threshold —
 /// re-encoding would produce a same-or-larger file, so refusing is the
 /// honest answer.
 fn plan_shrink(
@@ -244,16 +260,13 @@ fn plan_shrink(
     };
     let downscaling = output_height < profile.video.height;
 
-    // Step 2: target bitrate.
-    let threshold = crate::assess::bitrate_threshold_for_height(output_height);
-    let target_bps = match target_bitrate_bps {
-        Some(explicit) => explicit,
-        None => threshold,
-    };
-
-    // Step 3: refuse if there's literally nothing to shrink — no downscale,
+    // Step 2: refuse if there's literally nothing to shrink — no downscale,
     // no explicit bitrate target, and source is already at or below the
-    // implicit threshold.
+    // implicit per-height bitrate threshold. The threshold is x264-tuned
+    // and conservative; x265 with our default CRF would generally produce
+    // an even smaller file, but the size win is small and not worth a
+    // surprise re-encode of a file the user probably forgot was already small.
+    let threshold = crate::assess::bitrate_threshold_for_height(output_height);
     if !downscaling
         && target_bitrate_bps.is_none()
         && profile.bitrate_bps.is_some_and(|src| src <= threshold)
@@ -267,34 +280,43 @@ fn plan_shrink(
         )));
     }
 
-    // Step 4: compose the recipe. Most pieces match plan_reencode; only the
-    // video strategy and the (potential) downscale filter differ.
+    // Step 3: compose the recipe.
     let output_container = overrides.container.clone().unwrap_or(Container::Mkv);
+    let codec = overrides.video_codec.unwrap_or(VideoCodecChoice::X265);
     let preset = overrides
         .preset
         .clone()
-        .unwrap_or_else(|| "medium".to_string());
-    let codec = overrides
-        .video_codec
-        .unwrap_or_else(|| default_codec_choice(profile));
+        .unwrap_or_else(|| "slow".to_string());
 
-    // Single-pass ABR sized so VBV-induced peaks have headroom.
-    let max_bps = target_bps + target_bps / 4; // 1.25×
-    let bufsize_bps = target_bps * 2;          // 2.0×
-
-    let video_strategy = match codec {
-        VideoCodecChoice::X264 => VideoStrategy::ReencodeX264Abr {
-            target_bps,
-            max_bps,
-            bufsize_bps,
-            preset,
-        },
-        VideoCodecChoice::X265 => VideoStrategy::ReencodeX265Abr {
-            target_bps,
-            max_bps,
-            bufsize_bps,
-            preset,
-        },
+    let video_strategy = match target_bitrate_bps {
+        Some(target_bps) => {
+            // Explicit size target → single-pass ABR with VBV headroom.
+            let max_bps = target_bps + target_bps / 4; // 1.25×
+            let bufsize_bps = target_bps * 2;          // 2.0×
+            match codec {
+                VideoCodecChoice::X264 => VideoStrategy::ReencodeX264Abr {
+                    target_bps,
+                    max_bps,
+                    bufsize_bps,
+                    preset,
+                },
+                VideoCodecChoice::X265 => VideoStrategy::ReencodeX265Abr {
+                    target_bps,
+                    max_bps,
+                    bufsize_bps,
+                    preset,
+                },
+            }
+        }
+        None => {
+            let crf = overrides
+                .crf
+                .unwrap_or_else(|| shrink_default_crf(codec, output_height));
+            match codec {
+                VideoCodecChoice::X264 => VideoStrategy::ReencodeX264 { crf, preset },
+                VideoCodecChoice::X265 => VideoStrategy::ReencodeX265 { crf, preset },
+            }
+        }
     };
 
     // Filters: start from the reencode set (deinterlace + square-pixel
@@ -314,7 +336,8 @@ fn plan_shrink(
         });
     }
 
-    let audio_strategy = select_audio_strategy(profile, overrides);
+    let audio_strategy =
+        select_audio_strategy_for_shrink(profile, &output_container, overrides);
     let extra_flags = build_extra_flags(profile, &output_container);
 
     Ok(EncodeRecipe {
@@ -325,6 +348,36 @@ fn plan_shrink(
         extra_flags,
         concat: None,
     })
+}
+
+/// Default CRF for shrink mode. Higher (more compression) than
+/// [`default_crf`]'s reencode targets because the user has explicitly asked
+/// for a smaller file — quality bar is "visually indistinguishable from
+/// source" rather than "studio-master grade."
+///
+/// The x265 column is the common path (shrink defaults to x265); x264 is here
+/// for `--codec h264` overrides.
+fn shrink_default_crf(codec: VideoCodecChoice, height: u32) -> u8 {
+    match codec {
+        VideoCodecChoice::X264 => {
+            if height <= 720 {
+                22
+            } else if height <= 1080 {
+                23
+            } else {
+                24
+            }
+        }
+        VideoCodecChoice::X265 => {
+            if height <= 720 {
+                24
+            } else if height <= 1080 {
+                25
+            } else {
+                26
+            }
+        }
+    }
 }
 
 /// Compute the width that preserves the source aspect ratio when scaling to
@@ -573,6 +626,53 @@ fn select_video_filters(profile: &MediaProfile) -> Vec<VideoFilter> {
     }
 
     filters
+}
+
+/// Whether `container` natively and compat-reliably accepts `codec` as a
+/// stream-copied audio track.
+///
+/// Conservative by design:
+///
+/// - **MKV** accepts essentially anything (AAC, AC-3, E-AC-3, DTS, MP3,
+///   FLAC, Opus, Vorbis, PCM, WMA, …) — always `true`.
+/// - **MP4 / MOV** accept AAC, MP3, FLAC, ALAC, and E-AC-3 cleanly. AC-3 in
+///   MP4 is technically legal (ISO/IEC 14496-3) but widely broken in
+///   consumer players, so we refuse it here and force an AAC fallback.
+/// - **WebM** accepts Opus and Vorbis only.
+/// - Anything else (MpegPs, Avi, Flv, …) we never target as shrink output;
+///   refusing copy is the safe default.
+fn container_supports_audio_copy(container: &Container, codec: &AudioCodec) -> bool {
+    use AudioCodec::*;
+    match container {
+        Container::Mkv => true,
+        Container::Mp4 | Container::Mov => {
+            matches!(codec, Aac | Mp3 | Flac | Alac | Eac3)
+        }
+        Container::WebM => matches!(codec, Opus | Vorbis),
+        _ => false,
+    }
+}
+
+/// Audio strategy for shrink mode.
+///
+/// A manual ffmpeg user shrinking a file types `-c:a copy` because audio
+/// re-encode is generation loss for almost no size win. We do the same —
+/// except when the output container wouldn't accept the source codec
+/// cleanly (e.g. AC-3 into MP4), in which case we fall back to the same
+/// AAC policy the reencode planner uses.
+fn select_audio_strategy_for_shrink(
+    profile: &MediaProfile,
+    output_container: &Container,
+    overrides: &Overrides,
+) -> AudioStrategy {
+    let Some(primary) = profile.audio.first() else {
+        return AudioStrategy::Copy;
+    };
+    if container_supports_audio_copy(output_container, &primary.codec) {
+        AudioStrategy::Copy
+    } else {
+        select_audio_strategy(profile, overrides)
+    }
 }
 
 fn select_audio_strategy(profile: &MediaProfile, overrides: &Overrides) -> AudioStrategy {
@@ -910,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn shrink_default_targets_threshold_for_source_height() {
+    fn shrink_default_uses_x265_crf_slow_at_1080p() {
         let p = oversized_1080p_profile();
         let recipe = plan(
             &p,
@@ -923,28 +1023,21 @@ mod tests {
         )
         .expect("plan_shrink succeeds for oversized 1080p");
 
-        // ABR at the 1080p threshold (5 Mbps), max = 1.25× target,
-        // bufsize = 2× target.
-        match &recipe.video_strategy {
-            VideoStrategy::ReencodeX264Abr {
-                target_bps,
-                max_bps,
-                bufsize_bps,
-                preset,
-            } => {
-                assert_eq!(*target_bps, 5_000_000);
-                assert_eq!(*max_bps, 6_250_000);
-                assert_eq!(*bufsize_bps, 10_000_000);
-                assert_eq!(preset, "medium");
-            }
-            other => panic!("expected ReencodeX264Abr, got {other:?}"),
-        }
+        // No --target-bitrate ⇒ CRF mode. Default codec is x265 (manual
+        // shrink convention), default preset is `slow`, default CRF for
+        // 1080p x265 is 25.
+        assert_eq!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX265 { crf: 25, preset: "slow".into() }
+        );
+        // Audio is stream-copied (no generation loss for negligible savings).
+        assert_eq!(recipe.audio_strategy, AudioStrategy::Copy);
         // No downscale → no Scale filter.
         assert!(!recipe.video_filters.iter().any(|f| matches!(f, VideoFilter::Scale { .. })));
     }
 
     #[test]
-    fn shrink_with_max_height_downscales_and_targets_smaller_threshold() {
+    fn shrink_with_max_height_downscales_and_uses_lower_crf_band() {
         let p = oversized_1080p_profile();
         let recipe = plan(
             &p,
@@ -957,13 +1050,11 @@ mod tests {
         )
         .expect("plan_shrink");
 
-        // Target should now be the 720p threshold (3 Mbps), not 1080p's.
-        match &recipe.video_strategy {
-            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
-                assert_eq!(*target_bps, 3_000_000);
-            }
-            other => panic!("expected ReencodeX264Abr, got {other:?}"),
-        }
+        // Output height drops to 720p ⇒ x265 CRF default for ≤720p is 24.
+        assert_eq!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX265 { crf: 24, preset: "slow".into() }
+        );
 
         // Scale filter prepended with width preserving 16:9 aspect:
         // 1920 × 720 / 1080 = 1280.
@@ -976,7 +1067,10 @@ mod tests {
     }
 
     #[test]
-    fn shrink_with_explicit_target_bitrate_uses_it_verbatim() {
+    fn shrink_with_explicit_target_bitrate_switches_to_abr() {
+        // Explicit --target-bitrate is the "I need a predictable size"
+        // opt-in: planner switches from CRF to single-pass ABR with VBV
+        // headroom, codec stays at x265, preset stays at slow.
         let p = oversized_1080p_profile();
         let recipe = plan(
             &p,
@@ -990,17 +1084,18 @@ mod tests {
         .expect("plan_shrink");
 
         match &recipe.video_strategy {
-            VideoStrategy::ReencodeX264Abr {
+            VideoStrategy::ReencodeX265Abr {
                 target_bps,
                 max_bps,
                 bufsize_bps,
-                ..
+                preset,
             } => {
                 assert_eq!(*target_bps, 2_500_000);
                 assert_eq!(*max_bps, 3_125_000);
                 assert_eq!(*bufsize_bps, 5_000_000);
+                assert_eq!(preset, "slow");
             }
-            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+            other => panic!("expected ReencodeX265Abr, got {other:?}"),
         }
     }
 
@@ -1049,10 +1144,10 @@ mod tests {
         .expect("explicit target overrides nothing-to-shrink");
 
         match &recipe.video_strategy {
-            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
+            VideoStrategy::ReencodeX265Abr { target_bps, .. } => {
                 assert_eq!(*target_bps, 1_000_000);
             }
-            other => panic!("expected ReencodeX264Abr, got {other:?}"),
+            other => panic!("expected ReencodeX265Abr, got {other:?}"),
         }
     }
 
@@ -1074,18 +1169,17 @@ mod tests {
 
         // No Scale filter (no resolution change).
         assert!(!recipe.video_filters.iter().any(|f| matches!(f, VideoFilter::Scale { .. })));
-        // Bitrate target stays at 1080p's threshold.
-        match &recipe.video_strategy {
-            VideoStrategy::ReencodeX264Abr { target_bps, .. } => {
-                assert_eq!(*target_bps, 5_000_000);
-            }
-            other => panic!("expected ReencodeX264Abr, got {other:?}"),
-        }
+        // Output stays at 1080p ⇒ x265 CRF default for ≤1080p is 25.
+        assert_eq!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX265 { crf: 25, preset: "slow".into() }
+        );
     }
 
     #[test]
-    fn shrink_picks_x265_for_4k_or_hdr_sources() {
-        // 4K source: default codec is x265. Shrink should respect that.
+    fn shrink_uses_higher_crf_band_at_4k() {
+        // 4K source: still x265 (always, for shrink), but the CRF default
+        // bumps to 26 at >1080p.
         let mut p = oversized_1080p_profile();
         p.video.width = 3840;
         p.video.height = 2160;
@@ -1102,10 +1196,182 @@ mod tests {
         )
         .expect("plan_shrink");
 
-        assert!(matches!(
+        assert_eq!(
             recipe.video_strategy,
-            VideoStrategy::ReencodeX265Abr { .. }
-        ));
+            VideoStrategy::ReencodeX265 { crf: 26, preset: "slow".into() }
+        );
+    }
+
+    #[test]
+    fn shrink_default_codec_is_x265_even_for_sdr_1080p() {
+        // Regression: the previous shrink planner inherited
+        // `default_codec_choice`, which picked x264 for ≤1080p SDR. The
+        // updated planner uses x265 unconditionally (overridable).
+        let p = oversized_1080p_profile();
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+        assert!(
+            matches!(recipe.video_strategy, VideoStrategy::ReencodeX265 { .. }),
+            "expected x265 for SDR 1080p shrink, got {:?}",
+            recipe.video_strategy
+        );
+    }
+
+    #[test]
+    fn shrink_default_audio_is_copy_even_for_multichannel_source() {
+        // Regression: previous shrink planner downmixed 5.1 → AAC stereo
+        // (inherited from select_audio_strategy). The updated planner
+        // stream-copies audio for shrink — generation loss isn't worth
+        // the negligible size win.
+        let mut p = oversized_1080p_profile();
+        p.audio = vec![AudioInfo {
+            codec: AudioCodec::Ac3,
+            channels: Some(6),
+            channel_layout: Some("5.1".into()),
+            sample_rate_hz: Some(48_000),
+            bitrate_bps: Some(448_000),
+            language: Some("eng".into()),
+        }];
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
+        assert_eq!(recipe.audio_strategy, AudioStrategy::Copy);
+    }
+
+    #[test]
+    fn shrink_audio_falls_back_to_aac_when_ac3_targets_mp4() {
+        // AC-3 in MP4 is technically legal but compat-sketchy in consumer
+        // players, so shrink falls back to the reencode planner's AAC
+        // policy. Multichannel + default policy → AAC stereo downmix.
+        let mut p = oversized_1080p_profile();
+        p.audio = vec![AudioInfo {
+            codec: AudioCodec::Ac3,
+            channels: Some(6),
+            channel_layout: Some("5.1".into()),
+            sample_rate_hz: Some(48_000),
+            bitrate_bps: Some(448_000),
+            language: Some("eng".into()),
+        }];
+        let overrides = Overrides {
+            container: Some(Container::Mp4),
+            ..Overrides::default()
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &overrides,
+        )
+        .expect("plan_shrink");
+        assert_eq!(
+            recipe.audio_strategy,
+            AudioStrategy::AacStereo { bitrate_bps: 192_000 }
+        );
+    }
+
+    #[test]
+    fn shrink_audio_copies_aac_into_mp4() {
+        // AAC in MP4 is the most compatible audio path possible: copy.
+        let mut p = oversized_1080p_profile();
+        p.audio = vec![AudioInfo {
+            codec: AudioCodec::Aac,
+            channels: Some(2),
+            channel_layout: Some("stereo".into()),
+            sample_rate_hz: Some(48_000),
+            bitrate_bps: Some(192_000),
+            language: None,
+        }];
+        let overrides = Overrides {
+            container: Some(Container::Mp4),
+            ..Overrides::default()
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &overrides,
+        )
+        .expect("plan_shrink");
+        assert_eq!(recipe.audio_strategy, AudioStrategy::Copy);
+    }
+
+    #[test]
+    fn shrink_audio_falls_back_when_vorbis_targets_mp4() {
+        // Vorbis is a WebM-only codec from MP4's perspective: refuse copy,
+        // fall back to AAC. (Stereo source, default policy → AAC stereo.)
+        let mut p = oversized_1080p_profile();
+        p.audio = vec![AudioInfo {
+            codec: AudioCodec::Vorbis,
+            channels: Some(2),
+            channel_layout: Some("stereo".into()),
+            sample_rate_hz: Some(48_000),
+            bitrate_bps: Some(160_000),
+            language: None,
+        }];
+        let overrides = Overrides {
+            container: Some(Container::Mp4),
+            ..Overrides::default()
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &overrides,
+        )
+        .expect("plan_shrink");
+        assert_eq!(
+            recipe.audio_strategy,
+            AudioStrategy::AacStereo { bitrate_bps: 192_000 }
+        );
+    }
+
+    #[test]
+    fn shrink_honors_codec_crf_and_preset_overrides() {
+        let p = oversized_1080p_profile();
+        let overrides = Overrides {
+            video_codec: Some(VideoCodecChoice::X264),
+            crf: Some(20),
+            preset: Some("medium".into()),
+            ..Overrides::default()
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: None,
+                target_bitrate_bps: None,
+            },
+            &overrides,
+        )
+        .expect("plan_shrink");
+        assert_eq!(
+            recipe.video_strategy,
+            VideoStrategy::ReencodeX264 { crf: 20, preset: "medium".into() }
+        );
     }
 
     #[test]
