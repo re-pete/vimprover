@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::assess::{Assessment, Issue};
 use crate::model::{AudioInfo, MediaProfile, Rational, VideoInfo};
-use crate::plan::{AudioStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
+use crate::plan::{AudioStrategy, ConcatStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
 
 /// Produce the human-readable "Input:" block for a single file.
 pub fn render_profile(path: &Path, profile: &MediaProfile) -> String {
@@ -54,6 +54,19 @@ pub fn render_profile(path: &Path, profile: &MediaProfile) -> String {
 /// starts with `Plan:` and subsequent lines indent under the value column.
 pub fn render_recipe(recipe: &EncodeRecipe, output: &Path) -> String {
     let lines = collect_plan_lines(recipe, output);
+    render_aligned_block("Plan:", &lines)
+}
+
+/// Render a plan-summary block for a multi-input concat operation.
+///
+/// `inputs` is the ordered list of source files; `recipe` must have
+/// `concat == Some(_)` (other callers should use [`render_recipe`] instead).
+pub fn render_concat_recipe(
+    recipe: &EncodeRecipe,
+    inputs: &[&Path],
+    output: &Path,
+) -> String {
+    let lines = collect_concat_plan_lines(recipe, inputs, output);
     render_aligned_block("Plan:", &lines)
 }
 
@@ -111,6 +124,36 @@ fn describe_issue(issue: &Issue) -> String {
             "audio codec not supported by target container".into()
         }
     }
+}
+
+fn collect_concat_plan_lines(
+    recipe: &EncodeRecipe,
+    inputs: &[&Path],
+    output: &Path,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let strategy = match recipe.concat {
+        Some(ConcatStrategy::Demuxer) => "demuxer (stream copy)",
+        None => "plain",
+    };
+    lines.push(format!(
+        "Concat {} inputs via {strategy} into {}",
+        inputs.len(),
+        recipe.output_container
+    ));
+    for (i, path) in inputs.iter().enumerate() {
+        lines.push(format!("  [{}] {}", i + 1, path.display()));
+    }
+    if matches!(recipe.output_container, crate::model::Container::Mp4)
+        && recipe
+            .extra_flags
+            .iter()
+            .any(|f| f == "-movflags" || f == "+faststart")
+    {
+        lines.push("Enable MP4 faststart (moov before mdat)".into());
+    }
+    lines.push(format!("Output: {}", output.display()));
+    lines
 }
 
 fn collect_plan_lines(recipe: &EncodeRecipe, output: &Path) -> Vec<String> {
@@ -405,6 +448,7 @@ mod tests {
             video_filters: Vec::new(),
             audio_strategy: AudioStrategy::Copy,
             extra_flags: Vec::new(),
+            concat: None,
         };
         let out = render_recipe(&recipe, Path::new("newname.mkv"));
         let expected = "Plan:      Remux to Matroska (MKV) (stream copy, no re-encode)\n\
@@ -430,6 +474,7 @@ mod tests {
             ],
             audio_strategy: AudioStrategy::AacStereo { bitrate_bps: 192_000 },
             extra_flags: vec!["-movflags".into(), "+faststart".into()],
+            concat: None,
         };
         let out = render_recipe(&recipe, Path::new("/tmp/newname.mp4"));
         assert!(
@@ -490,5 +535,51 @@ mod tests {
         assert!(out.contains("Container: MP4, "));
         assert!(out.contains("Video:     H.264, 1920x1080, progressive, 30 fps, yuv420p"));
         assert!(out.contains("Audio:     (none)"));
+    }
+
+    #[test]
+    fn renders_concat_recipe_with_input_list() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mkv,
+            video_strategy: VideoStrategy::Copy,
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: Vec::new(),
+            concat: Some(ConcatStrategy::Demuxer),
+        };
+        let inputs: Vec<&Path> = vec![
+            Path::new("clip1.mp4"),
+            Path::new("clip2.mp4"),
+            Path::new("clip3.mp4"),
+        ];
+        let out = render_concat_recipe(&recipe, &inputs, Path::new("joined.mkv"));
+
+        // Header line.
+        assert!(
+            out.contains("Concat 3 inputs via demuxer (stream copy) into Matroska (MKV)"),
+            "got:\n{out}"
+        );
+        // Numbered list.
+        assert!(out.contains("[1] clip1.mp4"), "got:\n{out}");
+        assert!(out.contains("[2] clip2.mp4"), "got:\n{out}");
+        assert!(out.contains("[3] clip3.mp4"), "got:\n{out}");
+        // Output line.
+        assert!(out.ends_with("Output: joined.mkv"), "got:\n{out}");
+    }
+
+    #[test]
+    fn renders_concat_recipe_mp4_output_mentions_faststart() {
+        let recipe = EncodeRecipe {
+            output_container: Container::Mp4,
+            video_strategy: VideoStrategy::Copy,
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: vec!["-movflags".into(), "+faststart".into()],
+            concat: Some(ConcatStrategy::Demuxer),
+        };
+        let inputs: Vec<&Path> = vec![Path::new("a.mp4"), Path::new("b.mp4")];
+        let out = render_concat_recipe(&recipe, &inputs, Path::new("joined.mp4"));
+        assert!(out.contains("Concat 2 inputs"), "got:\n{out}");
+        assert!(out.contains("Enable MP4 faststart"), "got:\n{out}");
     }
 }

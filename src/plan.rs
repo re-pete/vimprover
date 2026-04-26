@@ -107,6 +107,21 @@ pub enum VideoFilter {
     SetSar { num: u32, den: u32 },
 }
 
+/// How ffmpeg should join multiple inputs. Only populated when the recipe
+/// was produced by [`plan_concat`]; single-file plans leave this `None`.
+///
+/// Step 6 ships only [`ConcatStrategy::Demuxer`] (fast, stream-copy,
+/// requires uniform inputs). The filter-concat path — which re-encodes to a
+/// common output spec and handles mismatched inputs — is deferred until a
+/// real-world use case demands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcatStrategy {
+    /// Use ffmpeg's concat *demuxer* (`-f concat -safe 0 -i LIST.txt`) to
+    /// join uniform inputs without re-encoding. The executor writes the
+    /// list file; the recipe just signals that this mode is active.
+    Demuxer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodeRecipe {
     pub output_container: Container,
@@ -114,6 +129,9 @@ pub struct EncodeRecipe {
     pub video_filters: Vec<VideoFilter>,
     pub audio_strategy: AudioStrategy,
     pub extra_flags: Vec<String>,
+    /// Set by [`plan_concat`] to signal multi-input concatenation. `None`
+    /// for ordinary single-file plans.
+    pub concat: Option<ConcatStrategy>,
 }
 
 /// Build an [`EncodeRecipe`] from a profile, assessment, and user intent.
@@ -142,9 +160,13 @@ pub fn plan(
         Intent::Shrink { max_height, target_bitrate_bps } => {
             plan_shrink(profile, overrides, *max_height, *target_bitrate_bps)
         }
-        Intent::Concat => Err(Error::Unimplemented(
-            "concat intent (build-order step 6)",
-        )),
+        // `plan()` is the single-input entry point. Concat is multi-input
+        // and has its own top-level entry, [`plan_concat`]; the CLI dispatches
+        // to it directly when ≥2 inputs are passed. If a library caller routes
+        // a single profile through `plan()` with `Intent::Concat`, that's a
+        // programmer error — surface it loudly rather than silently pretending
+        // it was a single-file plan.
+        Intent::Concat => Err(Error::ConcatTooFewInputs(1)),
     }
 }
 
@@ -169,6 +191,7 @@ fn plan_remux(_profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe {
         video_filters: Vec::new(),
         audio_strategy: AudioStrategy::Copy,
         extra_flags,
+        concat: None,
     }
 }
 
@@ -189,6 +212,7 @@ fn plan_reencode(profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe 
         video_filters,
         audio_strategy,
         extra_flags,
+        concat: None,
     }
 }
 
@@ -299,6 +323,7 @@ fn plan_shrink(
         video_filters,
         audio_strategy,
         extra_flags,
+        concat: None,
     })
 }
 
@@ -316,6 +341,166 @@ fn scaled_width_preserving_aspect(
     let scaled = (src_width as u64 * target_height as u64) / src_height as u64;
     // Round down to nearest even number.
     (scaled & !1) as u32
+}
+
+/// Build a stream-copy concat recipe.
+///
+/// Phase-1 concat supports only the demuxer path: inputs must have identical
+/// stream parameters (codec, resolution, pixel format, framerate, audio
+/// codec/channels/sample-rate). When they match, ffmpeg joins them without
+/// re-encoding — roughly 10× faster than the filter-concat path and producing
+/// bit-identical video.
+///
+/// `inputs` and `profiles` must have the same length and correspond 1:1.
+/// Returns:
+///
+/// - [`Error::ConcatTooFewInputs`] if fewer than two inputs were supplied.
+/// - [`Error::ConcatInputsDiffer`] naming the first input whose streams
+///   diverge from input #0, with a human-readable reason.
+///
+/// Passes through the usual container override (`--container`) and emits the
+/// MP4 faststart flag when targeting MP4.
+pub fn plan_concat(
+    inputs: &[&Path],
+    profiles: &[MediaProfile],
+    overrides: &Overrides,
+) -> Result<EncodeRecipe> {
+    assert_eq!(
+        inputs.len(),
+        profiles.len(),
+        "plan_concat: inputs and profiles slices must align",
+    );
+    if profiles.len() < 2 {
+        return Err(Error::ConcatTooFewInputs(profiles.len()));
+    }
+
+    let reference = &profiles[0];
+    for (i, p) in profiles.iter().enumerate().skip(1) {
+        if let Err(why) = streams_compatible(reference, p) {
+            return Err(Error::ConcatInputsDiffer {
+                path: inputs[i].to_path_buf(),
+                why,
+            });
+        }
+    }
+
+    let output_container = overrides.container.clone().unwrap_or(Container::Mkv);
+
+    let mut extra_flags: Vec<String> = Vec::new();
+    if matches!(output_container, Container::Mp4) {
+        extra_flags.push("-movflags".into());
+        extra_flags.push("+faststart".into());
+    }
+
+    Ok(EncodeRecipe {
+        output_container,
+        video_strategy: VideoStrategy::Copy,
+        video_filters: Vec::new(),
+        audio_strategy: AudioStrategy::Copy,
+        extra_flags,
+        concat: Some(ConcatStrategy::Demuxer),
+    })
+}
+
+/// Check whether two media profiles are stream-copy-concat-compatible. Returns
+/// `Ok(())` when they match, or a short human-readable description of the
+/// first field that differs.
+///
+/// The comparison covers the fields ffmpeg's concat demuxer is sensitive to
+/// in practice: video codec, resolution, pixel format, framerate, audio
+/// codec, channel count, and sample rate. SAR and HDR metadata are *not*
+/// checked; mismatch there still produces a playable file in every player
+/// the author has tested.
+pub fn streams_compatible(
+    a: &MediaProfile,
+    b: &MediaProfile,
+) -> std::result::Result<(), String> {
+    if a.video.codec != b.video.codec {
+        return Err(format!(
+            "video codec ({} vs {})",
+            a.video.codec, b.video.codec
+        ));
+    }
+    if (a.video.width, a.video.height) != (b.video.width, b.video.height) {
+        return Err(format!(
+            "video resolution ({}x{} vs {}x{})",
+            a.video.width, a.video.height, b.video.width, b.video.height
+        ));
+    }
+    if a.video.pix_fmt != b.video.pix_fmt {
+        let render = |p: Option<&PixFmt>| match p {
+            Some(pf) => pf.to_string(),
+            None => "unknown".to_string(),
+        };
+        return Err(format!(
+            "pixel format ({} vs {})",
+            render(a.video.pix_fmt.as_ref()),
+            render(b.video.pix_fmt.as_ref()),
+        ));
+    }
+    // Framerate: compare as a fraction within a small epsilon so 29.97 (NTSC)
+    // vs 30 (round) is flagged, but reported 24.000 vs 23.976 isn't. The
+    // demuxer tolerates tiny drift via CFR output; it does NOT tolerate a real
+    // 24 vs 30 mismatch.
+    if let (Some(x), Some(y)) = (a.video.framerate, b.video.framerate) {
+        if (x.as_f64() - y.as_f64()).abs() > 0.1 {
+            return Err(format!(
+                "framerate ({:.3} vs {:.3} fps)",
+                x.as_f64(),
+                y.as_f64()
+            ));
+        }
+    }
+
+    // Audio: compare the first track. Missing-audio-in-one-input is a
+    // structural mismatch we refuse. (Two no-audio inputs are fine.)
+    match (a.audio.first(), b.audio.first()) {
+        (Some(ax), Some(bx)) => {
+            if ax.codec != bx.codec {
+                return Err(format!(
+                    "audio codec ({} vs {})",
+                    ax.codec, bx.codec
+                ));
+            }
+            if ax.channels != bx.channels {
+                return Err(format!(
+                    "audio channel count ({} vs {})",
+                    describe_channels(ax.channels),
+                    describe_channels(bx.channels),
+                ));
+            }
+            if ax.sample_rate_hz != bx.sample_rate_hz {
+                return Err(format!(
+                    "audio sample rate ({} vs {})",
+                    describe_sample_rate(ax.sample_rate_hz),
+                    describe_sample_rate(bx.sample_rate_hz),
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err("audio tracks (reference has audio, this input does not)".into());
+        }
+        (None, Some(_)) => {
+            return Err("audio tracks (reference has no audio, this input does)".into());
+        }
+        (None, None) => {}
+    }
+
+    Ok(())
+}
+
+fn describe_channels(n: Option<u32>) -> String {
+    match n {
+        Some(n) => n.to_string(),
+        None => "unknown".into(),
+    }
+}
+
+fn describe_sample_rate(hz: Option<u32>) -> String {
+    match hz {
+        Some(hz) => format!("{hz} Hz"),
+        None => "unknown".into(),
+    }
 }
 
 fn select_video_strategy(profile: &MediaProfile, overrides: &Overrides) -> VideoStrategy {
@@ -1220,7 +1405,11 @@ mod tests {
     }
 
     #[test]
-    fn concat_intent_is_unimplemented() {
+    fn concat_intent_through_single_input_plan_errors() {
+        // `plan()` is the single-input entry point. Step 6 introduces
+        // `plan_concat()` for the multi-input case; routing Intent::Concat
+        // through plan() means the caller has only one profile, which is
+        // structurally not a concat.
         let p = sample_profile();
         let err = plan(
             &p,
@@ -1229,7 +1418,7 @@ mod tests {
             &Overrides::default(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Unimplemented(_)));
+        assert!(matches!(err, Error::ConcatTooFewInputs(1)), "got {err:?}");
     }
 
     #[test]
@@ -1318,5 +1507,241 @@ mod tests {
             container_from_output_extension(Path::new("Tutorial (MC 1.7.10) (Low)")),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_concat / streams_compatible
+    // -----------------------------------------------------------------------
+
+    /// 1080p H.264 + AAC stereo MP4. Two of these are the canonical
+    /// uniform-concat happy path.
+    fn modern_mp4_profile() -> MediaProfile {
+        MediaProfile {
+            container: Container::Mp4,
+            video: VideoInfo {
+                codec: VideoCodec::H264,
+                width: 1920,
+                height: 1080,
+                field_order: FieldOrder::Progressive,
+                framerate: Rational::new(24, 1),
+                pix_fmt: Some(PixFmt::Yuv420p),
+                sar: Rational::new(1, 1),
+                is_hdr: false,
+            },
+            audio: vec![AudioInfo {
+                codec: AudioCodec::Aac,
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                sample_rate_hz: Some(48_000),
+                bitrate_bps: Some(192_000),
+                language: None,
+            }],
+            duration_secs: Some(60.0),
+            file_size_bytes: Some(50_000_000),
+            bitrate_bps: Some(6_500_000),
+        }
+    }
+
+    #[test]
+    fn streams_compatible_accepts_identical_profiles() {
+        let a = modern_mp4_profile();
+        let b = modern_mp4_profile();
+        assert!(streams_compatible(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn streams_compatible_rejects_resolution_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.video.width = 1280;
+        b.video.height = 720;
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("resolution"), "got: {err}");
+        assert!(err.contains("1920x1080"), "got: {err}");
+        assert!(err.contains("1280x720"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_video_codec_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.video.codec = VideoCodec::H265;
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("video codec"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_pixel_format_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.video.pix_fmt = Some(PixFmt::Yuv422p);
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("pixel format"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_framerate_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.video.framerate = Rational::new(30, 1); // vs 24/1
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("framerate"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_tolerates_tiny_framerate_drift() {
+        // 23.976 vs 24.000 — within the 0.1 fps epsilon.
+        let mut a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        a.video.framerate = Rational::new(24000, 1001); // 23.976
+        b.video.framerate = Rational::new(24, 1);
+        assert!(streams_compatible(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn streams_compatible_rejects_audio_codec_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.audio[0].codec = AudioCodec::Ac3;
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("audio codec"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_channel_count_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.audio[0].channels = Some(6); // 5.1 vs stereo
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("channel"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_sample_rate_mismatch() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.audio[0].sample_rate_hz = Some(44_100);
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("sample rate"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_rejects_audio_present_only_on_one_side() {
+        let a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        b.audio.clear();
+        let err = streams_compatible(&a, &b).unwrap_err();
+        assert!(err.contains("audio"), "got: {err}");
+    }
+
+    #[test]
+    fn streams_compatible_accepts_no_audio_on_either_side() {
+        let mut a = modern_mp4_profile();
+        let mut b = modern_mp4_profile();
+        a.audio.clear();
+        b.audio.clear();
+        assert!(streams_compatible(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn plan_concat_uniform_inputs_produces_demuxer_recipe() {
+        let inputs: Vec<&Path> = vec![
+            Path::new("/tmp/a.mp4"),
+            Path::new("/tmp/b.mp4"),
+            Path::new("/tmp/c.mp4"),
+        ];
+        let profiles = vec![
+            modern_mp4_profile(),
+            modern_mp4_profile(),
+            modern_mp4_profile(),
+        ];
+        let recipe = plan_concat(&inputs, &profiles, &Overrides::default()).unwrap();
+        assert_eq!(recipe.concat, Some(ConcatStrategy::Demuxer));
+        assert_eq!(recipe.video_strategy, VideoStrategy::Copy);
+        assert_eq!(recipe.audio_strategy, AudioStrategy::Copy);
+        assert!(recipe.video_filters.is_empty());
+        // Default container: MKV (no faststart flags).
+        assert_eq!(recipe.output_container, Container::Mkv);
+        assert!(recipe.extra_flags.is_empty());
+    }
+
+    #[test]
+    fn plan_concat_mp4_override_emits_faststart() {
+        let inputs: Vec<&Path> = vec![Path::new("/tmp/a.mp4"), Path::new("/tmp/b.mp4")];
+        let profiles = vec![modern_mp4_profile(), modern_mp4_profile()];
+        let overrides = Overrides {
+            container: Some(Container::Mp4),
+            ..Default::default()
+        };
+        let recipe = plan_concat(&inputs, &profiles, &overrides).unwrap();
+        assert_eq!(recipe.output_container, Container::Mp4);
+        assert_eq!(recipe.concat, Some(ConcatStrategy::Demuxer));
+        assert_eq!(
+            recipe.extra_flags,
+            vec!["-movflags".to_string(), "+faststart".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_concat_refuses_mismatched_resolution() {
+        let inputs: Vec<&Path> = vec![Path::new("/tmp/a.mp4"), Path::new("/tmp/b.mp4")];
+        let mut second = modern_mp4_profile();
+        second.video.width = 1280;
+        second.video.height = 720;
+        let profiles = vec![modern_mp4_profile(), second];
+        let err = plan_concat(&inputs, &profiles, &Overrides::default()).unwrap_err();
+        match err {
+            Error::ConcatInputsDiffer { path, why } => {
+                assert_eq!(path, PathBuf::from("/tmp/b.mp4"));
+                assert!(why.contains("resolution"), "got: {why}");
+            }
+            _ => panic!("wrong error variant: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_concat_refuses_single_input() {
+        let inputs: Vec<&Path> = vec![Path::new("/tmp/a.mp4")];
+        let profiles = vec![modern_mp4_profile()];
+        let err = plan_concat(&inputs, &profiles, &Overrides::default()).unwrap_err();
+        assert!(matches!(err, Error::ConcatTooFewInputs(1)), "got {err:?}");
+    }
+
+    #[test]
+    fn plan_concat_zero_inputs_refuses() {
+        let inputs: Vec<&Path> = vec![];
+        let profiles: Vec<MediaProfile> = vec![];
+        let err = plan_concat(&inputs, &profiles, &Overrides::default()).unwrap_err();
+        assert!(matches!(err, Error::ConcatTooFewInputs(0)), "got {err:?}");
+    }
+
+    #[test]
+    fn plan_concat_first_mismatch_wins_when_multiple_differ() {
+        // Inputs: [ref, ok, mismatch1, mismatch2]. Should report on input #3
+        // (1-indexed) = "/tmp/c.mp4", not the later one.
+        let inputs: Vec<&Path> = vec![
+            Path::new("/tmp/ref.mp4"),
+            Path::new("/tmp/b.mp4"),
+            Path::new("/tmp/c.mp4"),
+            Path::new("/tmp/d.mp4"),
+        ];
+        let mut third = modern_mp4_profile();
+        third.video.width = 1280;
+        third.video.height = 720;
+        let mut fourth = modern_mp4_profile();
+        fourth.video.codec = VideoCodec::H265;
+        let profiles = vec![
+            modern_mp4_profile(),
+            modern_mp4_profile(),
+            third,
+            fourth,
+        ];
+        let err = plan_concat(&inputs, &profiles, &Overrides::default()).unwrap_err();
+        match err {
+            Error::ConcatInputsDiffer { path, .. } => {
+                assert_eq!(path, PathBuf::from("/tmp/c.mp4"));
+            }
+            _ => panic!("wrong error variant: {err:?}"),
+        }
     }
 }

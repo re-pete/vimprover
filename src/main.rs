@@ -1,6 +1,6 @@
 //! `vimprover` binary entry point.
 //!
-//! Step 4 wiring:
+//! Single-file flow:
 //!
 //! 1. Parse CLI args.
 //! 2. `--probe-only` short-circuit prints just the probe and exits.
@@ -13,6 +13,17 @@
 //! 8. **Confirmation prompt** (unless `--yes`): ask `[Y/n]` and require
 //!    `--yes` for non-TTY stdin.
 //! 9. Execute via [`vimprover::execute::run_recipe`].
+//!
+//! Concat flow (≥2 inputs, build-order step 6):
+//!
+//! 1. Parse CLI args.
+//! 2. Probe each input in order → print the per-input profile.
+//! 3. [`vimprover::plan::plan_concat`] checks stream uniformity; on mismatch
+//!    bails with a precise error pointing at the offending input.
+//! 4. Render the concat plan with [`vimprover::format::render_concat_recipe`].
+//! 5. Dry-run / confirmation prompt as in single-file flow.
+//! 6. Execute via [`vimprover::execute::run_recipe`] (which writes the
+//!    concat-demuxer list file under the hood).
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -54,29 +65,39 @@ async fn main() -> Result<()> {
     let user_output = paths.pop().expect("checked len >= 2");
     let inputs = paths;
 
-    if inputs.len() > 1 {
+    let intent = intent_from_args(&args);
+    let overrides = overrides_from_args(&args, &user_output);
+    let flags = FlowFlags {
+        dry_run: args.dry_run,
+        overwrite: args.overwrite,
+        force: args.force,
+        yes: args.yes,
+    };
+
+    // Multi-input ⇒ concat flow. Single-input + Intent::Concat is rejected
+    // upstream by the planner via `Error::ConcatTooFewInputs`.
+    if inputs.len() >= 2 {
+        // Reject explicit non-concat intents that don't make sense with
+        // multiple inputs. (Auto is fine — it implies concat.)
+        match intent {
+            Intent::Auto | Intent::Concat => {}
+            Intent::Remux | Intent::Reencode | Intent::Shrink { .. } => bail!(
+                "intent {:?} doesn't make sense with multiple inputs; \
+                 omit --intent or use --intent concat",
+                intent
+            ),
+        }
+        return run_concat(&inputs, &user_output, overrides, flags).await;
+    }
+
+    if matches!(intent, Intent::Concat) {
         bail!(
-            "concat mode (multiple inputs) is not implemented yet \
-             — coming in build-order step 6"
+            "--intent concat needs at least two inputs (got 1); \
+             pass each input as a positional argument before the output path"
         );
     }
 
-    let intent = intent_from_args(&args);
-    let overrides = overrides_from_args(&args, &user_output);
-
-    run_single_file(
-        &inputs[0],
-        &user_output,
-        intent,
-        overrides,
-        FlowFlags {
-            dry_run: args.dry_run,
-            overwrite: args.overwrite,
-            force: args.force,
-            yes: args.yes,
-        },
-    )
-    .await
+    run_single_file(&inputs[0], &user_output, intent, overrides, flags).await
 }
 
 /// Bundle of per-invocation flow-control flags so `run_single_file` doesn't
@@ -101,6 +122,7 @@ fn intent_from_args(args: &Args) -> Intent {
                 max_height: args.max_height,
                 target_bitrate_bps: args.target_bitrate,
             },
+            cli::CliIntent::Concat => Intent::Concat,
         };
     }
 
@@ -204,6 +226,7 @@ async fn run_single_file(
             &output,
             &recipe,
             flags.overwrite,
+            None, // single-file: no concat list
         );
         println!();
         println!("Command:   {}", execute::render_command(&ffmpeg, &argv));
@@ -224,6 +247,94 @@ async fn run_single_file(
     execute::run_recipe(
         &[input],
         std::slice::from_ref(&profile.container),
+        &output,
+        &recipe,
+        flags.overwrite,
+    )
+    .await
+    .with_context(|| format!("encoding to {}", output.display()))?;
+
+    println!("Done. Wrote {}.", output.display());
+    Ok(())
+}
+
+/// Multi-input concat flow. Phase 1: demuxer-only stream-copy concat with a
+/// strict uniformity check.
+///
+/// Probes each input in order, hands the slice to [`plan::plan_concat`], and
+/// — if uniform — runs the same dry-run / prompt / execute path the single-
+/// file flow uses.
+async fn run_concat(
+    inputs: &[PathBuf],
+    user_output: &Path,
+    overrides: Overrides,
+    flags: FlowFlags,
+) -> Result<()> {
+    // 1. Probe every input. We print each profile so the user can eyeball
+    //    the inputs before any work happens.
+    let mut profiles: Vec<MediaProfile> = Vec::with_capacity(inputs.len());
+    for (i, path) in inputs.iter().enumerate() {
+        let profile = probe::probe_file(path)
+            .await
+            .with_context(|| format!("probing input #{} ({})", i + 1, path.display()))?;
+        if i > 0 {
+            println!();
+        }
+        println!("{}", format::render_profile(path, &profile));
+        profiles.push(profile);
+    }
+
+    // 2. Plan: uniformity check + recipe. Errors here carry the "normalize
+    //    first" hint already.
+    let input_refs: Vec<&Path> = inputs.iter().map(PathBuf::as_path).collect();
+    let recipe = plan::plan_concat(&input_refs, &profiles, &overrides)
+        .with_context(|| "planning concat")?;
+
+    // 3. Resolve output path + render the plan.
+    let output = plan::resolve_output_path(user_output, &recipe);
+    println!();
+    println!(
+        "{}",
+        format::render_concat_recipe(&recipe, &input_refs, &output)
+    );
+
+    // 4. Dry-run short-circuit. Build the same argv the run will use, with
+    //    a placeholder list-file path so the user can see the shape of the
+    //    command. (The real list file is written by run_recipe at exec time.)
+    if flags.dry_run {
+        let ffmpeg = execute::locate_ffmpeg()?;
+        let placeholder = std::path::Path::new("<concat-list-tempfile>");
+        // Source containers: we still need the slice for the API, even
+        // though concat-mode skips per-input genpts.
+        let containers: Vec<_> = profiles.iter().map(|p| p.container.clone()).collect();
+        let argv = execute::build_ffmpeg_args(
+            &input_refs,
+            &containers,
+            &output,
+            &recipe,
+            flags.overwrite,
+            Some(placeholder),
+        );
+        println!();
+        println!("Command:   {}", execute::render_command(&ffmpeg, &argv));
+        println!();
+        println!("(dry run — not executing; the list file is created at run time)");
+        return Ok(());
+    }
+
+    // 5. Confirmation prompt.
+    if !flags.yes && !confirm_proceed()? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // 6. Execute.
+    println!();
+    println!("Running ffmpeg…");
+    let containers: Vec<_> = profiles.iter().map(|p| p.container.clone()).collect();
+    execute::run_recipe(
+        &input_refs,
+        &containers,
         &output,
         &recipe,
         flags.overwrite,

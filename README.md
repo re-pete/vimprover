@@ -10,28 +10,22 @@ The full design — including the build order this work follows — lives in
 
 ## Status
 
-**Build-order step 5: shrink mode.** Adds an explicit `--intent shrink`
-that re-encodes a file at a smaller bitrate and/or resolution, with
-intent-aware assessment that flags `BitrateExcessive` (above the
-per-resolution threshold) and `ResolutionWasteful` (1440p+ at low
-bits-per-pixel). Encoding uses single-pass ABR (`-b:v / -maxrate /
--bufsize`) so the output bitrate is predictable.
+**Build-order step 6: concat mode.** Multiple inputs (≥2) trigger
+demuxer-based stream-copy concatenation. The planner probes every input,
+verifies they share codec / resolution / pixel format / framerate / audio
+parameters, and — when uniform — joins them via ffmpeg's `-f concat`
+demuxer with no re-encoding (typically 10× faster than re-encoding).
 
-Three shrink modes:
+Non-uniform inputs are refused with a precise error naming the offending
+input and the field that differs, plus a hint to normalize via
+`vimprover --reencode` or `--intent shrink` first. Phase 1 deliberately
+stops there; the filter-concat re-encode-to-common-spec path is deferred
+until there's demand.
 
-- `--intent shrink` (no targets): DWIM — cap output bitrate at the
-  threshold for the source's height. Refuses if the source is already at
-  or below threshold ("nothing to shrink").
-- `--intent shrink --max-height 720`: downscale 16:9-correctly and target
-  the 720p threshold (3 Mbps).
-- `--intent shrink --target-bitrate 2.5M`: explicit bitrate (suffixes
-  `k`/`M`/`G` accepted), no downscale unless `--max-height` also set.
-
-Bare `--max-height` or `--target-bitrate` (without `--intent`) implies
-shrink. Step 4's earlier features still apply: assess() runs, Issues are
-rendered, the `[Y/n]` prompt fires unless `--yes`, fine-gate refuses Auto
-on already-fine files unless `--force`. Explicit intents (Reencode, Shrink)
-bypass the fine-gate.
+Everything from earlier steps still applies: assess(), the `Issues:`
+block, the `[Y/n]` prompt unless `--yes`, fine-gate, intent overrides.
+`--intent shrink` adds bitrate-excessive / resolution-wasteful flagging
+and single-pass ABR encoding.
 
 ## Requirements
 
@@ -97,6 +91,14 @@ VIMPROVER_LOG=info cargo run -- --yes old-movie.vob newname
 VIMPROVER_FFPROBE=/opt/ffmpeg/bin/ffprobe \
 VIMPROVER_FFMPEG=/opt/ffmpeg/bin/ffmpeg \
     cargo run -- --yes old-movie.vob newname
+
+# Concat: multiple inputs → single output. Inputs must already be
+# uniform (same codec/resolution/audio); vimprover refuses with a clear
+# error otherwise.
+cargo run -- --yes part1.mp4 part2.mp4 part3.mp4 joined
+
+# Same operation with the explicit intent (handy for scripts):
+cargo run -- --yes --intent concat clip1.mp4 clip2.mp4 joined.mkv
 ```
 
 Example output (Auto on a DVD-shaped MPEG-PS source):

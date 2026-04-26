@@ -1,8 +1,8 @@
 //! Step 5 of the pipeline: build ffmpeg argv and run it.
 //!
-//! In build-order step 2 only the stream-copy remux path is exercised, but the
-//! arg-builder handles every [`VideoStrategy`] / [`AudioStrategy`] / [`VideoFilter`]
-//! defined in [`crate::plan`] so future steps drop in cleanly.
+//! Handles every [`VideoStrategy`] / [`AudioStrategy`] / [`VideoFilter`] from
+//! [`crate::plan`], plus (as of step 6) the concat-demuxer path for
+//! multi-input stream-copy concatenation.
 //!
 //! Implementation notes from `CLAUDE.md`:
 //!
@@ -11,21 +11,24 @@
 //!   ffmpeg's stderr so the user sees progress/errors live.
 //! - Capture stderr-style failures via the exit status; ffmpeg has already
 //!   printed its diagnostic to the terminal.
-//! - Support multi-step pipelines for concat mode (deferred to step 6).
+//! - Concat mode uses ffmpeg's `-f concat -safe 0 -i LIST.txt` demuxer; the
+//!   list file is a short-lived tempfile with properly-escaped paths.
 //! - Log exact ffmpeg commands at info level via [`render_command`] so users
 //!   can paste them into a terminal to reproduce.
 
 use std::env;
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tracing::{debug, info};
 
 use crate::error::{Error, Result};
 use crate::model::Container;
-use crate::plan::{AudioStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
+use crate::plan::{AudioStrategy, ConcatStrategy, EncodeRecipe, VideoFilter, VideoStrategy};
 
 /// Locate the ffmpeg binary, preferring the `VIMPROVER_FFMPEG` env override.
 pub fn locate_ffmpeg() -> Result<PathBuf> {
@@ -43,14 +46,23 @@ pub fn locate_ffmpeg() -> Result<PathBuf> {
 /// of `source_containers` is the container of `inputs[i]` (used to apply
 /// per-input flags such as `-fflags +genpts` for MPEG program/transport streams).
 ///
-/// In step 2, exactly one input is supported. Multi-input concat lands in
-/// step 6.
+/// Two input modes are supported:
+///
+/// - **Single-file / multi-separate-input**: pass each `input[i]` as its own
+///   `-i` arg. Triggered when `recipe.concat` is `None`.
+/// - **Concat demuxer**: pass one virtual input via `-f concat -safe 0 -i
+///   LIST`. Triggered when `recipe.concat == Some(ConcatStrategy::Demuxer)`.
+///   `concat_list_file` must be `Some(list_path)` in this case; the caller
+///   (typically [`run_recipe`]) writes the list file. In concat mode,
+///   per-input `-fflags +genpts` is skipped — the demuxer handles timestamps
+///   across segments when stream-copying uniform inputs.
 pub fn build_ffmpeg_args(
     inputs: &[&Path],
     source_containers: &[Container],
     output: &Path,
     recipe: &EncodeRecipe,
     overwrite: bool,
+    concat_list_file: Option<&Path>,
 ) -> Vec<OsString> {
     assert_eq!(
         inputs.len(),
@@ -66,23 +78,58 @@ pub fn build_ffmpeg_args(
     args.push("-stats".into());
     args.push(if overwrite { "-y" } else { "-n" }.into());
 
-    for (path, container) in inputs.iter().zip(source_containers) {
-        // Per-input flags. `+genpts` asks the demuxer to regenerate missing
-        // PTS from DTS, which MP4/MKV/MOV muxers require. Needed for:
-        // - MPEG-PS/TS (VOB, transport streams) — classical NOPTS sources.
-        // - AVI carrying MPEG-4 ASP (Xvid/DivX) with B-frames: AVI has no
-        //   per-packet PTS, and the demuxer cannot infer display-order
-        //   timestamps for reordered frames without help.
-        if needs_genpts(container) {
-            args.push("-fflags".into());
-            args.push("+genpts".into());
+    match (recipe.concat, concat_list_file) {
+        (Some(ConcatStrategy::Demuxer), Some(list_path)) => {
+            // Concat demuxer: one virtual input, stream-copy across segments.
+            // `-safe 0` is required because our list-file paths are absolute
+            // and may contain characters ffmpeg's default safety check
+            // rejects. `+genpts` isn't needed: with uniform stream-copy the
+            // demuxer concatenates frame timestamps cleanly.
+            args.push("-f".into());
+            args.push("concat".into());
+            args.push("-safe".into());
+            args.push("0".into());
+            args.push("-i".into());
+            args.push(list_path.as_os_str().into());
         }
-        args.push("-i".into());
-        args.push((*path).as_os_str().into());
+        (Some(ConcatStrategy::Demuxer), None) => {
+            // Programmer error: concat recipe but no list file provided.
+            // Fall through to the per-input -i path; the caller's tests
+            // will surface the bug.
+            for (path, container) in inputs.iter().zip(source_containers) {
+                if needs_genpts(container) {
+                    args.push("-fflags".into());
+                    args.push("+genpts".into());
+                }
+                args.push("-i".into());
+                args.push((*path).as_os_str().into());
+            }
+        }
+        (None, _) => {
+            for (path, container) in inputs.iter().zip(source_containers) {
+                // Per-input flags. `+genpts` asks the demuxer to regenerate
+                // missing PTS from DTS, which MP4/MKV/MOV muxers require.
+                // Needed for:
+                // - MPEG-PS/TS (VOB, transport streams) — classical NOPTS.
+                // - AVI carrying MPEG-4 ASP (Xvid/DivX) with B-frames: AVI
+                //   has no per-packet PTS, and the demuxer cannot infer
+                //   display-order timestamps for reordered frames without
+                //   help.
+                if needs_genpts(container) {
+                    args.push("-fflags".into());
+                    args.push("+genpts".into());
+                }
+                args.push("-i".into());
+                args.push((*path).as_os_str().into());
+            }
+        }
     }
 
-    // Stream selection. Single-input only for step 2.
-    if inputs.len() == 1 {
+    // Stream selection. In both single-file and concat-demuxer modes there
+    // is exactly one virtual input 0, so the map specification is identical.
+    let select_streams =
+        recipe.concat.is_some() || inputs.len() == 1;
+    if select_streams {
         for s in ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?"] {
             args.push(s.into());
         }
@@ -225,6 +272,10 @@ fn push_shell_escaped(out: &mut String, s: &str) {
 /// Spawn ffmpeg according to `recipe`. `inherit`s stdio so the user sees
 /// ffmpeg's progress and errors live; on non-zero exit returns
 /// [`Error::FfmpegFailed`].
+///
+/// When `recipe.concat == Some(Demuxer)`, writes a temp list file for the
+/// concat demuxer (auto-deleted when ffmpeg exits — success or failure)
+/// before spawning.
 pub async fn run_recipe(
     inputs: &[&Path],
     source_containers: &[Container],
@@ -236,8 +287,24 @@ pub async fn run_recipe(
         return Err(Error::OutputExists(output.to_path_buf()));
     }
 
+    // Keep the list-file handle alive for the duration of the ffmpeg run; it
+    // auto-deletes on drop.
+    let concat_list = if matches!(recipe.concat, Some(ConcatStrategy::Demuxer)) {
+        Some(write_concat_list(inputs)?)
+    } else {
+        None
+    };
+    let list_path = concat_list.as_ref().map(|f| f.path());
+
     let ffmpeg = locate_ffmpeg()?;
-    let args = build_ffmpeg_args(inputs, source_containers, output, recipe, overwrite);
+    let args = build_ffmpeg_args(
+        inputs,
+        source_containers,
+        output,
+        recipe,
+        overwrite,
+        list_path,
+    );
     let cmd_str = render_command(&ffmpeg, &args);
     info!(cmd = %cmd_str, "running ffmpeg");
     debug!(?ffmpeg, ?args, "spawning ffmpeg");
@@ -256,7 +323,58 @@ pub async fn run_recipe(
         });
     }
 
+    // `concat_list` drops here, unlinking the temp file.
+    drop(concat_list);
     Ok(())
+}
+
+/// Write a tempfile containing the ffmpeg concat-demuxer list format, one
+/// `file '<path>'` directive per input.
+///
+/// **Absolute-path normalization** (critical): ffmpeg's concat demuxer
+/// resolves relative paths in the list file *relative to the list file's
+/// directory*, not the caller's CWD. Since our list file lives in the
+/// system temp directory, a relative input like `fo1.mkv` would be looked
+/// up as `/tmp/fo1.mkv` and fail. We therefore convert every input to an
+/// absolute path here via [`std::path::absolute`] (lexical; no filesystem
+/// access, no symlink following) before writing it out.
+///
+/// **Quoting** follows ffmpeg's documented rules for the concat demuxer:
+/// paths are wrapped in single quotes; any embedded `'` is escaped as
+/// `'\''` (close-quote, literal-quote, open-quote). Backslashes are NOT
+/// special — they pass through literally, so Windows-style paths work.
+///
+/// The caller owns the returned `NamedTempFile` and must keep it alive for
+/// as long as ffmpeg needs to read the list (typically: spawn → wait).
+pub fn write_concat_list(inputs: &[&Path]) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::with_prefix("vimprover-concat-")?;
+    for input in inputs {
+        let absolute = std::path::absolute(input)?;
+        let line = format!("file '{}'\n", escape_concat_list_path(&absolute));
+        file.write_all(line.as_bytes())?;
+    }
+    file.flush()?;
+    Ok(file)
+}
+
+/// Escape a path for ffmpeg's concat-demuxer list file.
+///
+/// Inside a single-quoted ffmpeg directive, only the single quote is special.
+/// See <https://ffmpeg.org/ffmpeg-formats.html#concat>.
+fn escape_concat_list_path(path: &Path) -> String {
+    // `to_string_lossy` is fine here: concat's list-file parser reads bytes
+    // as UTF-8. If the user's filesystem uses a non-UTF-8 encoding, ffmpeg
+    // wouldn't be able to open the file via this list anyway.
+    let raw = path.to_string_lossy();
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +394,7 @@ mod tests {
             video_filters: Vec::new(),
             audio_strategy: AudioStrategy::Copy,
             extra_flags: Vec::new(),
+            concat: None,
         }
     }
 
@@ -286,6 +405,7 @@ mod tests {
             video_filters: Vec::new(),
             audio_strategy: AudioStrategy::Copy,
             extra_flags: vec!["-movflags".into(), "+faststart".into()],
+            concat: None,
         }
     }
 
@@ -298,7 +418,7 @@ mod tests {
         let inputs: &[&Path] = &[Path::new("/tmp/movie.vob")];
         let containers = &[Container::MpegPs];
         let out = Path::new("/tmp/newname.mkv");
-        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mkv(), false);
+        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mkv(), false, None);
 
         assert_eq!(
             args_as_str(&args),
@@ -337,7 +457,7 @@ mod tests {
         let inputs: &[&Path] = &[Path::new("/tmp/movie.avi")];
         let containers = &[Container::Avi];
         let out = Path::new("/tmp/out.mkv");
-        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mkv(), false);
+        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mkv(), false, None);
         let strs = args_as_str(&args);
 
         let genpts_idx = strs
@@ -372,7 +492,7 @@ mod tests {
         let inputs: &[&Path] = &[Path::new("/tmp/in.flv")];
         let containers = &[Container::Flv];
         let out = Path::new("/tmp/out.mp4");
-        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mp4(), true);
+        let args = build_ffmpeg_args(inputs, containers, out, &remux_recipe_mp4(), true, None);
         let strs = args_as_str(&args);
 
         // Overwrite mode uses -y, not -n.
@@ -418,5 +538,188 @@ mod tests {
             VideoFilter::SetSar { num: 1, den: 1 },
         ]);
         assert_eq!(chain, "bwdif=1,scale=1920:1080,setsar=1/1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Concat-demuxer mode (step 6)
+    // -----------------------------------------------------------------------
+
+    fn concat_recipe_mkv() -> EncodeRecipe {
+        EncodeRecipe {
+            output_container: Container::Mkv,
+            video_strategy: VideoStrategy::Copy,
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: Vec::new(),
+            concat: Some(ConcatStrategy::Demuxer),
+        }
+    }
+
+    #[test]
+    fn concat_argv_uses_concat_demuxer_with_list_file() {
+        let inputs: &[&Path] = &[Path::new("/tmp/a.mp4"), Path::new("/tmp/b.mp4")];
+        let containers = &[Container::Mp4, Container::Mp4];
+        let out = Path::new("/tmp/joined.mkv");
+        let list = Path::new("/tmp/concat-list.txt");
+
+        let args = build_ffmpeg_args(
+            inputs,
+            containers,
+            out,
+            &concat_recipe_mkv(),
+            false,
+            Some(list),
+        );
+
+        assert_eq!(
+            args_as_str(&args),
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-stats",
+                "-n",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                "/tmp/concat-list.txt",
+                // single virtual input → same -map as single-file mode
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-map",
+                "0:s?",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-c:s",
+                "copy",
+                "/tmp/joined.mkv",
+            ]
+        );
+    }
+
+    #[test]
+    fn concat_argv_skips_per_input_genpts_even_for_avi() {
+        // Even if the inputs would normally trigger -fflags +genpts (e.g. AVI),
+        // concat-demuxer mode skips them: timestamps are reconstructed from
+        // the concatenated stream, not the per-input demuxers.
+        let inputs: &[&Path] = &[Path::new("/tmp/a.avi"), Path::new("/tmp/b.avi")];
+        let containers = &[Container::Avi, Container::Avi];
+        let out = Path::new("/tmp/joined.mkv");
+        let list = Path::new("/tmp/list.txt");
+
+        let args = build_ffmpeg_args(
+            inputs,
+            containers,
+            out,
+            &concat_recipe_mkv(),
+            false,
+            Some(list),
+        );
+        let strs = args_as_str(&args);
+
+        assert!(!strs.iter().any(|s| s == "-fflags"), "should not emit -fflags in concat mode: {strs:?}");
+        assert!(!strs.iter().any(|s| s == "+genpts"), "should not emit +genpts in concat mode: {strs:?}");
+    }
+
+    #[test]
+    fn concat_argv_passes_through_mp4_faststart() {
+        let inputs: &[&Path] = &[Path::new("/tmp/a.mp4"), Path::new("/tmp/b.mp4")];
+        let containers = &[Container::Mp4, Container::Mp4];
+        let out = Path::new("/tmp/joined.mp4");
+        let list = Path::new("/tmp/list.txt");
+
+        let recipe = EncodeRecipe {
+            output_container: Container::Mp4,
+            video_strategy: VideoStrategy::Copy,
+            video_filters: Vec::new(),
+            audio_strategy: AudioStrategy::Copy,
+            extra_flags: vec!["-movflags".into(), "+faststart".into()],
+            concat: Some(ConcatStrategy::Demuxer),
+        };
+        let args = build_ffmpeg_args(inputs, containers, out, &recipe, false, Some(list));
+        let strs = args_as_str(&args);
+
+        let faststart_idx = strs.iter().position(|s| s == "+faststart").unwrap();
+        assert_eq!(strs[faststart_idx - 1], "-movflags");
+        assert_eq!(strs.last().unwrap(), "/tmp/joined.mp4");
+    }
+
+    #[test]
+    fn escape_concat_list_path_passes_through_simple_paths() {
+        assert_eq!(
+            escape_concat_list_path(Path::new("/tmp/clip1.mp4")),
+            "/tmp/clip1.mp4"
+        );
+    }
+
+    #[test]
+    fn escape_concat_list_path_escapes_single_quotes() {
+        // 'foo' becomes '\'' (close, escaped quote, reopen) — that's three
+        // chars -> four char output for one input quote.
+        assert_eq!(
+            escape_concat_list_path(Path::new("/tmp/it's.mp4")),
+            r"/tmp/it'\''s.mp4"
+        );
+    }
+
+    #[test]
+    fn escape_concat_list_path_passes_spaces_and_backslashes() {
+        // Spaces are fine inside single-quoted directives. Backslashes are
+        // not special to ffmpeg's concat demuxer.
+        assert_eq!(
+            escape_concat_list_path(Path::new("/tmp/with spaces.mp4")),
+            "/tmp/with spaces.mp4"
+        );
+        assert_eq!(
+            escape_concat_list_path(Path::new(r"C:\videos\clip.mp4")),
+            r"C:\videos\clip.mp4"
+        );
+    }
+
+    #[test]
+    fn write_concat_list_emits_file_directives() {
+        // Absolute inputs are written verbatim (modulo quote escaping).
+        let inputs: &[&Path] = &[
+            Path::new("/tmp/a.mp4"),
+            Path::new("/tmp/b's.mp4"),
+            Path::new("/tmp/c with space.mp4"),
+        ];
+        let f = write_concat_list(inputs).expect("write list");
+        let content = std::fs::read_to_string(f.path()).expect("read list");
+        let expected = "\
+file '/tmp/a.mp4'
+file '/tmp/b'\\''s.mp4'
+file '/tmp/c with space.mp4'
+";
+        assert_eq!(content, expected);
+    }
+
+    /// Regression: ffmpeg's concat demuxer resolves relative paths in the
+    /// list file relative to the list-file's *directory*, not the caller's
+    /// CWD. Since our list file is under /tmp, a bare `foo.mkv` argument
+    /// used to be looked up as `/tmp/foo.mkv` and fail with "Impossible to
+    /// open". The fix is to absolutize every input before writing.
+    #[test]
+    fn write_concat_list_absolutizes_relative_paths() {
+        let inputs: &[&Path] = &[Path::new("fo1.mkv"), Path::new("./fo2.mkv")];
+        let f = write_concat_list(inputs).expect("write list");
+        let content = std::fs::read_to_string(f.path()).expect("read list");
+
+        // Each line must start with "file '/" — i.e. the path is absolute.
+        for (i, line) in content.lines().enumerate() {
+            assert!(
+                line.starts_with("file '/"),
+                "line {i} should be absolute; got: {line}"
+            );
+        }
+        // And the basenames must still be present at the end.
+        assert!(content.contains("fo1.mkv'"), "content:\n{content}");
+        assert!(content.contains("fo2.mkv'"), "content:\n{content}");
     }
 }

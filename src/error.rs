@@ -60,6 +60,25 @@ pub enum Error {
     )]
     NothingToShrink(String),
 
+    /// Returned by [`crate::plan::plan_concat`] when the inputs have
+    /// non-uniform stream parameters. Demuxer-mode concat requires every
+    /// input to match exactly; we refuse rather than silently produce a
+    /// broken output. The error carries the offending input's path and a
+    /// human-readable description of the first field that differed.
+    #[error(
+        "concat refused: {path} differs from input #1 in {why}. \
+         Demuxer-mode concat requires uniform streams; normalize the \
+         differing input first (e.g. with a single-file `vimprover --reencode` \
+         or `vimprover --intent shrink --max-height ...` run), then retry."
+    )]
+    ConcatInputsDiffer { path: PathBuf, why: String },
+
+    /// Returned when a concat operation is requested with fewer than two
+    /// inputs. The CLI shouldn't ever produce this — it's a last-line-of-
+    /// defense for library callers.
+    #[error("concat needs at least two inputs (got {0})")]
+    ConcatTooFewInputs(usize),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

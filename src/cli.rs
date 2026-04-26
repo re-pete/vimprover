@@ -142,14 +142,17 @@ impl From<CliCodec> for VideoCodecChoice {
 
 /// Pipeline intent exposed on the CLI. Maps 1:1 onto the library's
 /// `Intent` enum (with shrink params filled in from `--max-height` /
-/// `--target-bitrate` at the binary boundary). `concat` is left out because
-/// concat is implicit when ≥2 inputs are passed (build-order step 6).
+/// `--target-bitrate` at the binary boundary).
+///
+/// `Concat` is also implicit when ≥2 inputs are passed; specifying
+/// `--intent concat` is just an explicit form for scripts.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliIntent {
     Auto,
     Remux,
     Reencode,
     Shrink,
+    Concat,
 }
 
 /// Parse a bitrate string like `5M`, `750k`, or `5000000` into bits/sec.
