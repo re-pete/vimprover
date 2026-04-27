@@ -178,6 +178,46 @@ fn synthesize_interlaced_mpeg2_ps(out: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Generate a 352×240 MPEG-1 / MP2 / MPEG-PS source with SAR 200:219 — the
+/// classic NTSC VCD/MPG capture shape. SAR 200:219 yields display width
+/// 352 × 200/219 ≈ 321.46 → 321, an *odd* number that libx264/x265 in 4:2:0
+/// reject ("width not divisible by 2"). The planner must round the
+/// SAR-correction Scale dims down to even before handing them to the
+/// encoder; this synthesizer is the regression case for that fix.
+fn synthesize_odd_display_width_mpeg1(out: &Path) -> bool {
+    Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=352x240:rate=30000/1001",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "mpeg1video",
+            "-vf",
+            "setsar=200/219",
+            "-b:v",
+            "1100k",
+            "-c:a",
+            "mp2",
+            "-b:a",
+            "128k",
+            "-f",
+            "mpeg",
+        ])
+        .arg(out)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Generate a small MPEG program-stream file that looks like a DVD VOB:
 /// MPEG-2 video + AC-3 audio in an MPEG-PS container.
 fn synthesize_mpeg_ps(out: &Path) -> bool {
@@ -423,6 +463,85 @@ fn reencodes_interlaced_mpeg2_to_progressive_h264() {
     assert!(
         probe_str.contains("field_order=progressive"),
         "expected progressive output:\n{probe_str}"
+    );
+}
+
+/// Regression: a 352×240 SAR 200:219 MPEG-1 source (NTSC VCD/MPG-capture
+/// shape) yields display width 321 (odd), which libx264/x265 in 4:2:0 reject
+/// with "width not divisible by 2". The planner rounds the SAR-correction
+/// Scale dims down to even (320×240); this end-to-end test verifies the fix
+/// holds through ffmpeg actually producing a valid output.
+#[test]
+fn upgrade_handles_odd_display_width_from_sar_correction() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not found on PATH; skipping integration test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input = dir.path().join("clip.mpg");
+    let expected_output = dir.path().join("clip.mkv");
+
+    assert!(
+        synthesize_odd_display_width_mpeg1(&input),
+        "synthesize 352x240 SAR 200:219 MPEG-1 source"
+    );
+
+    let result = Command::new(vimprover_bin())
+        .arg("--upgrade")
+        .arg("--yes")
+        .arg(&input)
+        .output()
+        .expect("spawn vimprover");
+
+    assert!(
+        result.status.success(),
+        "vimprover --upgrade failed (the bug is back?): \
+         status={:?}\nstdout:\n{}\nstderr:\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("Scale to 320x240"),
+        "plan must round odd display width 321 down to 320:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Set square pixel aspect ratio"),
+        "expected SAR-correction step in plan:\n{stdout}"
+    );
+
+    // Probe the encoded output and confirm both dimensions are even.
+    assert!(expected_output.exists(), "expected output at {}",
+            expected_output.display());
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,sample_aspect_ratio",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&expected_output)
+        .output()
+        .expect("spawn ffprobe");
+    let probe_str = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_str.contains("codec_name=h264"),
+        "expected H.264 output:\n{probe_str}"
+    );
+    assert!(
+        probe_str.contains("width=320"),
+        "expected width 320 (even):\n{probe_str}"
+    );
+    assert!(
+        probe_str.contains("height=240"),
+        "expected height 240 (even):\n{probe_str}"
     );
 }
 

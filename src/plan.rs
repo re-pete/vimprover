@@ -202,7 +202,7 @@ fn plan_remux(_profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe {
 fn plan_reencode(profile: &MediaProfile, overrides: &Overrides) -> EncodeRecipe {
     let output_container = overrides.container.clone().unwrap_or(Container::Mkv);
     let video_strategy = select_video_strategy(profile, overrides);
-    let video_filters = select_video_filters(profile);
+    let video_filters = select_video_filters(profile, None);
     let audio_strategy = select_audio_strategy(profile, overrides);
     let extra_flags = build_extra_flags(profile, &output_container);
 
@@ -319,22 +319,12 @@ fn plan_shrink(
         }
     };
 
-    // Filters: start from the reencode set (deinterlace + square-pixel
-    // correction), then prepend a downscale Scale filter when needed.
-    let mut video_filters = select_video_filters(profile);
-    if downscaling {
-        let output_width = scaled_width_preserving_aspect(
-            profile.video.width,
-            profile.video.height,
-            output_height,
-        );
-        // Prepend so the downscale runs before any post-deinterlace filters
-        // (cheaper to deinterlace fewer pixels).
-        video_filters.insert(0, VideoFilter::Scale {
-            width: output_width,
-            height: output_height,
-        });
-    }
+    // Build the filter chain. select_video_filters folds the (optional)
+    // downscale and SAR correction into one display-space scale operation,
+    // which avoids the historical bug where shrink-on-non-square-SAR
+    // sources emitted a downscale immediately followed by an upscale back
+    // to original-display dims.
+    let video_filters = select_video_filters(profile, Some(output_height));
 
     let audio_strategy =
         select_audio_strategy_for_shrink(profile, &output_container, overrides);
@@ -378,22 +368,6 @@ fn shrink_default_crf(codec: VideoCodecChoice, height: u32) -> u8 {
             }
         }
     }
-}
-
-/// Compute the width that preserves the source aspect ratio when scaling to
-/// `target_height`. Rounds to even (libx264 / libx265 require dimensions
-/// divisible by 2 in standard 4:2:0 chroma subsampling).
-fn scaled_width_preserving_aspect(
-    src_width: u32,
-    src_height: u32,
-    target_height: u32,
-) -> u32 {
-    if src_height == 0 {
-        return src_width; // pathological; let ffmpeg complain
-    }
-    let scaled = (src_width as u64 * target_height as u64) / src_height as u64;
-    // Round down to nearest even number.
-    (scaled & !1) as u32
 }
 
 /// Build a stream-copy concat recipe.
@@ -606,24 +580,64 @@ fn default_crf(codec: VideoCodecChoice, height: u32) -> u8 {
     }
 }
 
-fn select_video_filters(profile: &MediaProfile) -> Vec<VideoFilter> {
+/// Build the video filter chain for a re-encode (or shrink-with-downscale).
+///
+/// When `target_height` is `Some(h)` with `h < profile.video.height`, the
+/// chain includes a downscale to height `h`. The downscale and any
+/// SAR-correction are computed in *display* space, so a non-square-SAR
+/// source plus a downscale produces a single combined `scale=W:H` filter
+/// rather than two scales that double-count (a real bug pre-fix:
+/// downscale → SAR-correction would scale-down then scale-back-up to the
+/// original display dims, defeating the downscale entirely).
+///
+/// Output filter order:
+/// - `bwdif` (if interlaced) — deinterlace first, before any scaling, so
+///   the deinterlacer sees the original fields rather than mixed-field
+///   downscaled rows.
+/// - `scale=W:H` (if downscaling or SAR ≠ 1) — combined.
+/// - `setsar=1:1` (if the source had non-square SAR) — declares the
+///   output square-pixel.
+///
+/// Both Scale dims are rounded *down* to even — libx264/libx265 in 4:2:0
+/// reject odd width or height ("width not divisible by 2"). Common with
+/// NTSC SAR ratios: 352×240 SAR 200:219 → display 321×240; the planner
+/// must emit 320×240.
+fn select_video_filters(
+    profile: &MediaProfile,
+    target_height: Option<u32>,
+) -> Vec<VideoFilter> {
     let mut filters = Vec::new();
 
     if profile.video.field_order.is_interlaced() {
         filters.push(VideoFilter::Bwdif);
     }
 
-    // Square-pixel correction: rescale to display size and reset SAR to 1:1.
-    // Round both dimensions down to even — libx264/libx265 in 4:2:0 reject
-    // odd width or height ("width not divisible by 2"). Common with NTSC SAR
-    // ratios: 352×240 SAR 200:219 → display 321×240, which fails the encoder.
-    if let Some(sar) = profile.video.sar {
-        if sar.num != sar.den {
-            let (display_w, display_h) = profile.video.display_size();
-            filters.push(VideoFilter::Scale {
-                width: display_w & !1,
-                height: display_h & !1,
-            });
+    let has_non_square_sar = profile
+        .video
+        .sar
+        .is_some_and(|s| s.num != s.den);
+    let downscaling = target_height.is_some_and(|h| h < profile.video.height);
+
+    if downscaling || has_non_square_sar {
+        let (display_w, display_h) = profile.video.display_size();
+        // Pathological zero-height source: bail out and let ffmpeg complain.
+        if display_h == 0 {
+            return filters;
+        }
+        let out_h = if downscaling {
+            target_height.unwrap()
+        } else {
+            display_h
+        };
+        // Width computed in display (square-pixel) space. When downscaling,
+        // this scales display_w by (out_h / display_h); when not, it equals
+        // display_w. Either way, the resulting frame is square-pixel.
+        let out_w = (display_w as u64 * out_h as u64) / display_h as u64;
+        filters.push(VideoFilter::Scale {
+            width: (out_w & !1) as u32,
+            height: out_h & !1,
+        });
+        if has_non_square_sar {
             filters.push(VideoFilter::SetSar { num: 1, den: 1 });
         }
     }
@@ -1378,15 +1392,75 @@ mod tests {
     }
 
     #[test]
-    fn scaled_width_preserving_aspect_rounds_to_even() {
-        // Standard 16:9 cases all give even widths.
-        assert_eq!(scaled_width_preserving_aspect(1920, 1080, 720), 1280);
-        assert_eq!(scaled_width_preserving_aspect(3840, 2160, 1080), 1920);
-        assert_eq!(scaled_width_preserving_aspect(1920, 1080, 480), 852);
+    fn shrink_with_max_height_and_non_square_sar_emits_one_combined_scale() {
+        // Pre-fix bug repro: 720×480 SAR 16:11 (DVD widescreen 16:9 NTSC)
+        // with --max-height 360 produced a chain that downscaled to coded
+        // 540×360, then SAR-corrected back to display 1046×480 — defeating
+        // the downscale and distorting aspect ratio.
+        //
+        // Post-fix: a single combined Scale in display space, with width
+        // computed as display_w × out_h / display_h:
+        //   display_w = round(720 × 16/11) = 1047
+        //   out_w = 1047 × 360 / 480 = 785.25 → 785 → round-down-even = 784
+        //   out_h = 360
+        // Plus setsar=1/1 to declare the output square-pixel.
+        let p = MediaProfile {
+            container: Container::MpegPs,
+            video: VideoInfo {
+                codec: VideoCodec::Mpeg2,
+                width: 720,
+                height: 480,
+                field_order: FieldOrder::Progressive,
+                framerate: Rational::new(60_000, 1001),
+                pix_fmt: Some(PixFmt::Yuv420p),
+                sar: Rational::new(16, 11),
+                is_hdr: false,
+            },
+            audio: vec![AudioInfo {
+                codec: AudioCodec::Ac3,
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                sample_rate_hz: Some(48_000),
+                bitrate_bps: Some(192_000),
+                language: None,
+            }],
+            duration_secs: Some(60.0),
+            file_size_bytes: Some(50_000_000),
+            bitrate_bps: Some(6_000_000),
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Shrink {
+                max_height: Some(360),
+                target_bitrate_bps: None,
+            },
+            &Overrides::default(),
+        )
+        .expect("plan_shrink");
 
-        // Non-standard aspect that would compute to an odd width:
-        // 1919 × 720 / 1080 = 1279.33 → 1279 → rounded down to 1278.
-        assert_eq!(scaled_width_preserving_aspect(1919, 1080, 720), 1278);
+        let scales: Vec<&VideoFilter> = recipe
+            .video_filters
+            .iter()
+            .filter(|f| matches!(f, VideoFilter::Scale { .. }))
+            .collect();
+        assert_eq!(
+            scales.len(),
+            1,
+            "expected exactly one Scale filter (no double-scale), got: {scales:?}"
+        );
+        assert_eq!(
+            *scales[0],
+            VideoFilter::Scale { width: 784, height: 360 },
+            "downscale + SAR correction must combine into one display-space scale"
+        );
+        assert!(
+            recipe
+                .video_filters
+                .iter()
+                .any(|f| matches!(f, VideoFilter::SetSar { num: 1, den: 1 })),
+            "expected setsar=1/1 to declare the output square-pixel"
+        );
     }
 
     #[test]
