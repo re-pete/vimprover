@@ -614,12 +614,15 @@ fn select_video_filters(profile: &MediaProfile) -> Vec<VideoFilter> {
     }
 
     // Square-pixel correction: rescale to display size and reset SAR to 1:1.
+    // Round both dimensions down to even — libx264/libx265 in 4:2:0 reject
+    // odd width or height ("width not divisible by 2"). Common with NTSC SAR
+    // ratios: 352×240 SAR 200:219 → display 321×240, which fails the encoder.
     if let Some(sar) = profile.video.sar {
         if sar.num != sar.den {
             let (display_w, display_h) = profile.video.display_size();
             filters.push(VideoFilter::Scale {
-                width: display_w,
-                height: display_h,
+                width: display_w & !1,
+                height: display_h & !1,
             });
             filters.push(VideoFilter::SetSar { num: 1, den: 1 });
         }
@@ -1577,6 +1580,55 @@ mod tests {
             recipe.audio_strategy,
             AudioStrategy::AacStereo { bitrate_bps: 192_000 }
         );
+    }
+
+    #[test]
+    fn reencode_sar_correction_rounds_odd_display_width_to_even() {
+        // Repro: 352×240 MPEG-1 with SAR 200:219 (common low-bitrate VCD/MPG
+        // capture). Display width = 352 × 200 / 219 ≈ 321.46 → 321. libx264
+        // refuses odd widths in 4:2:0; the planner must round down to 320.
+        let p = MediaProfile {
+            container: Container::MpegPs,
+            video: VideoInfo {
+                codec: VideoCodec::Mpeg1,
+                width: 352,
+                height: 240,
+                field_order: FieldOrder::Progressive,
+                framerate: Rational::new(60000, 1001),
+                pix_fmt: Some(PixFmt::Yuv420p),
+                sar: Rational::new(200, 219),
+                is_hdr: false,
+            },
+            audio: vec![AudioInfo {
+                codec: AudioCodec::Mp2,
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                sample_rate_hz: Some(44_100),
+                bitrate_bps: Some(128_000),
+                language: None,
+            }],
+            duration_secs: Some(60.0),
+            file_size_bytes: Some(10_000_000),
+            bitrate_bps: Some(1_100_000),
+        };
+        let recipe = plan(
+            &p,
+            &Assessment::default(),
+            &Intent::Reencode,
+            &Overrides::default(),
+        )
+        .unwrap();
+        let scale = recipe
+            .video_filters
+            .iter()
+            .find_map(|f| match f {
+                VideoFilter::Scale { width, height } => Some((*width, *height)),
+                _ => None,
+            })
+            .expect("expected a Scale filter from SAR correction");
+        assert_eq!(scale, (320, 240));
+        assert_eq!(scale.0 % 2, 0, "scale width must be even for libx264");
+        assert_eq!(scale.1 % 2, 0, "scale height must be even for libx264");
     }
 
     #[test]
