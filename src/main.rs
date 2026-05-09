@@ -288,6 +288,7 @@ async fn run_single_file(
         &output,
         &recipe,
         flags.overwrite,
+        &profile
     )
     .await
     .with_context(|| format!("encoding to {}", output.display()))?;
@@ -383,6 +384,7 @@ async fn run_concat(
         &output,
         &recipe,
         flags.overwrite,
+        &profiles[0],
     )
     .await
     .with_context(|| format!("encoding to {}", output.display()))?;
@@ -529,6 +531,7 @@ async fn run_upgrade(
         &paths.output,
         &recipe,
         flags.overwrite,
+        &profile,
     )
     .await;
 
