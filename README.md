@@ -52,11 +52,13 @@ Refuses to clobber pre-existing outputs or stale backups without
 `Issues:` block, the `[Y/n]` prompt unless `--yes`, the fine-gate
 (refuses already-fine files in `Auto` mode without `--force`), intent
 overrides, and `--intent shrink` with bitrate-excessive /
-resolution-wasteful flagging plus single-pass ABR encoding.
+resolution-wasteful flagging. Shrink re-encodes with x265 CRF by
+default; single-pass ABR is only used when `--target-bitrate` is given.
 
-**Deferred:** a parsed progress bar (via `ffmpeg -progress pipe:1`).
-ffmpeg's native `frame=… time=…` stats line is inherited to the
-terminal in the meantime, which is good enough for a v1.
+**Progress:** ffmpeg's stats output is suppressed (`-loglevel warning
+-nostats`); vimprover instead parses `-progress pipe:2` and prints a
+running `"Your file is X.X% completed"` line on single-file encodes.
+A richer progress bar (indicatif) is deferred.
 
 ## Requirements
 
