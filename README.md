@@ -55,10 +55,8 @@ overrides, and `--intent shrink` with bitrate-excessive /
 resolution-wasteful flagging. Shrink re-encodes with x265 CRF by
 default; single-pass ABR is only used when `--target-bitrate` is given.
 
-**Progress:** ffmpeg's stats output is suppressed (`-loglevel warning
--nostats`); vimprover instead parses `-progress pipe:2` and prints a
-running `"Your file is X.X% completed"` line on single-file encodes.
-A richer progress bar (indicatif) is deferred.
+**Progress:** ffmpeg runs with `-loglevel warning`; its output goes
+directly to the terminal. No progress bar yet — that is deferred.
 
 ## Requirements
 
@@ -201,7 +199,11 @@ src/
 └── execute.rs   # build ffmpeg argv, run it (atomic partial→rename), surface errors
 
 tests/
-└── remux.rs     # end-to-end integration tests (needs ffmpeg)
+├── remux.rs          # end-to-end integration tests (needs ffmpeg)
+└── fixtures/         # synthetic test videos at various resolutions
+
+scripts/
+└── shrink4k.fish     # fish function: scan directories and batch-shrink >1080p files
 ```
 
 ## License
