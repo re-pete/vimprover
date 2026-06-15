@@ -1,11 +1,14 @@
-function shrink4k --description "Find and shrink >1080p video files to 1080p using vimprover"
+function shrink4k --description "Find and shrink oversized video files using vimprover"
     set -l recursive false
     set -l dry_run false
     set -l auto_yes false
     set -l min_shrink 25
+    set -l target_height 1080
     set -l do_process false
     set -l do_list false
+    set -l do_done false
     set -l do_clear false
+    set -l remove_file ""
     set -l queue_file_override ""
     set -l dir ""
 
@@ -23,8 +26,19 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
                 set do_process true
             case --list
                 set do_list true
+            case --done
+                set do_done true
             case --clear
                 set do_clear true
+            case --remove
+                set idx (math $idx + 1)
+                if test $idx -gt (count $argv)
+                    echo "shrink4k: --remove requires a value" >&2
+                    return 1
+                end
+                set remove_file $argv[$idx]
+            case '--remove=*'
+                set remove_file (string replace --regex '^--remove=' '' $arg)
             case --queue-file
                 set idx (math $idx + 1)
                 if test $idx -gt (count $argv)
@@ -51,27 +65,47 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
                     echo "shrink4k: --min-shrink must be 0–100" >&2
                     return 1
                 end
+            case --target-height
+                set idx (math $idx + 1)
+                if test $idx -gt (count $argv)
+                    echo "shrink4k: --target-height requires a value" >&2
+                    return 1
+                end
+                set target_height $argv[$idx]
+                if not string match -qr '^\d+$' $target_height
+                    echo "shrink4k: --target-height must be a positive integer" >&2
+                    return 1
+                end
+            case '--target-height=*'
+                set target_height (string replace --regex '^--target-height=' '' $arg)
+                if not string match -qr '^\d+$' $target_height
+                    echo "shrink4k: --target-height must be a positive integer" >&2
+                    return 1
+                end
             case --help -h
                 echo "Usage: shrink4k [options] [DIRECTORY]"
                 echo ""
                 echo "Modes:"
-                echo "  (default)          Scan DIRECTORY (default: .) and append new candidates to the queue"
-                echo "  --list             Show files currently in the queue"
-                echo "  --clear            Empty the queue"
-                echo "  --process          Process files from the queue one at a time"
+                echo "  (default)             Scan DIRECTORY (default: .) and append candidates to the queue"
+                echo "  --list                Show files currently in the queue"
+                echo "  --done                Show files that have been processed"
+                echo "  --remove FILE         Remove a specific file from the queue"
+                echo "  --clear               Empty the queue"
+                echo "  --process             Process files from the queue one at a time"
                 echo ""
                 echo "Queue files (default): ~/.local/share/shrink4k/queue  and  .../done"
                 echo ""
                 echo "Options:"
-                echo "  -r, --recursive    Descend into subdirectories (default: top-level only)"
-                echo "  -n, --dry-run      Show what would happen without doing it"
-                echo "  -y, --yes          Pass --yes to vimprover (skip per-file confirmation)"
-                echo "  --min-shrink PCT   Skip files below PCT% pixel reduction (default: 25)"
-                echo "  --queue-file PATH  Use PATH instead of ~/.local/share/shrink4k/queue"
+                echo "  -r, --recursive       Descend into subdirectories (default: top-level only)"
+                echo "  -n, --dry-run         Show what would happen without doing it"
+                echo "  -y, --yes             Pass --yes to vimprover (skip per-file confirmation)"
+                echo "  --target-height H     Target height in pixels (default: 1080)"
+                echo "  --min-shrink PCT      Skip files below PCT% pixel reduction (default: 25)"
+                echo "  --queue-file PATH     Use PATH instead of ~/.local/share/shrink4k/queue"
                 return 0
             case '-*'
                 echo "shrink4k: unknown option: $arg" >&2
-                echo "Usage: shrink4k [options] DIRECTORY  (--help for full usage)" >&2
+                echo "Usage: shrink4k [options] [DIRECTORY]  (--help for full usage)" >&2
                 return 1
             case '*'
                 if test -n "$dir"
@@ -119,6 +153,21 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
         echo "Cleared $total file(s) from queue ($queue_file)"
 
     # -------------------------------------------------------------------------
+    else if test -n "$remove_file"
+    # REMOVE MODE: drop one entry from the queue
+    # -------------------------------------------------------------------------
+
+        if grep -qxF -- "$remove_file" "$queue_file" 2>/dev/null
+            set -l tmp (mktemp)
+            grep -Fxv -- "$remove_file" "$queue_file" > $tmp 2>/dev/null; true
+            mv $tmp "$queue_file"
+            echo "Removed from queue: $remove_file"
+        else
+            echo "shrink4k: not found in queue: $remove_file" >&2
+            return 1
+        end
+
+    # -------------------------------------------------------------------------
     else if test "$do_list" = true
     # LIST MODE: show queue contents
     # -------------------------------------------------------------------------
@@ -131,6 +180,22 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
         end
         echo "Queue ($total file(s)) — $queue_file"
         for f in $pending
+            echo "  $f"
+        end
+
+    # -------------------------------------------------------------------------
+    else if test "$do_done" = true
+    # DONE MODE: show processed files
+    # -------------------------------------------------------------------------
+
+        set -l completed (grep -v '^[[:space:]]*$' "$done_file" 2>/dev/null)
+        set -l total (count $completed)
+        if test $total -eq 0
+            echo "Done list is empty ($done_file)"
+            return 0
+        end
+        echo "Done ($total file(s)) — $done_file"
+        for f in $completed
             echo "  $f"
         end
 
@@ -184,13 +249,13 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
             echo "encode   $f"
 
             if test "$dry_run" = true
-                echo "         (dry-run) vimprover --max-height 1080 --upgrade $yes_flag \"$f\""
+                echo "         (dry-run) vimprover --max-height $target_height --upgrade $yes_flag \"$f\""
                 set n_done (math $n_done + 1)
                 echo ""
                 continue
             end
 
-            vimprover --max-height 1080 --upgrade $yes_flag "$f"
+            vimprover --max-height $target_height --upgrade $yes_flag "$f"
             if test $status -eq 0
                 set -l tmp (mktemp)
                 grep -Fxv -- "$f" "$queue_file" > $tmp 2>/dev/null; true
@@ -268,14 +333,17 @@ function shrink4k --description "Find and shrink >1080p video files to 1080p usi
                 continue
             end
 
-            set -l long_side (math "max($width, $height)")
-            if test $long_side -le 1920
+            # Skip if the short side already fits within the target height.
+            # Using min(width,height) handles portrait and landscape uniformly,
+            # and correctly ignores ultrawides where --max-height wouldn't help.
+            set -l short_side (math "min($width, $height)")
+            if test $short_side -le $target_height
                 set n_skipped (math $n_skipped + 1)
-                echo "skip     $f  ($width""x$height, longest side ≤1920)"
+                echo "skip     $f  ($width""x$height, short side ≤$target_height""p)"
                 continue
             end
 
-            set -l shrink_pct (math -s0 "(1 - (min($height, 1080) / $height) ^ 2) * 100")
+            set -l shrink_pct (math -s0 "(1 - (min($height, $target_height) / $height) ^ 2) * 100")
             if test $shrink_pct -lt $min_shrink
                 set n_skipped (math $n_skipped + 1)
                 echo "skip     $f  ($width""x$height, ~$shrink_pct""% pixel reduction, below $min_shrink""% threshold)"
