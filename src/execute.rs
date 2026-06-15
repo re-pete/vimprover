@@ -75,9 +75,6 @@ pub fn build_ffmpeg_args(
     args.push("-hide_banner".into());
     args.push("-loglevel".into());
     args.push("warning".into());
-    args.push("-progress".into());
-    args.push("pipe:2".into());
-    args.push("-nostats".into());
     args.push(if overwrite { "-y" } else { "-n" }.into());
 
     match (recipe.concat, concat_list_file) {
@@ -286,14 +283,12 @@ fn push_shell_escaped(out: &mut String, s: &str) {
 /// When `recipe.concat == Some(Demuxer)`, writes a temp list file for the
 /// concat demuxer (auto-deleted when ffmpeg exits — success or failure)
 /// before spawning.
-use crate::model::MediaProfile;
 pub async fn run_recipe(
     inputs: &[&Path],
     source_containers: &[Container],
     output: &Path,
     recipe: &EncodeRecipe,
     overwrite: bool,
-    profile: &MediaProfile,
 ) -> Result<()> {
     if !overwrite && output.exists() {
         return Err(Error::OutputExists(output.to_path_buf()));
@@ -337,45 +332,8 @@ pub async fn run_recipe(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()?;
-
-    use tokio::io::BufReader;
-    if let Some(stderr) = child.stderr.take() {
-        let mut reader = BufReader::new(stderr);
-
-        let mut line = String::new();
-        loop {
-            use tokio::io::AsyncReadExt;
-            let byte = reader.read_u8().await;
-            match byte {
-                Ok(byte) => {
-                    line.push(byte as char);
-                    if byte == b'\n' {
-                        if line.starts_with("out_time_us=") {
-                            let mut iter = line.split('=');
-                            iter.next();
-                            // let secs : i64 = iter.next().unwrap().parse().unwrap();
-                            let mut secs = iter.next().unwrap().trim().parse::<f64>().unwrap();
-                            secs = secs / 1000000 as f64;
-                            // println!("Duration: {}", secs);
-                            println!("Your file is {:>4.1}% completed", secs/profile.duration_secs.unwrap()*100 as f64);
-
-                        }
-                        line.clear();
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // EOF is expected when ffmpeg finishes
-                    break;
-                }
-                Err(e) => {
-                    println!("Error reading byte: {:?}", e);
-                    break;
-                }
-            }
-        }
-    };
 
 
 
