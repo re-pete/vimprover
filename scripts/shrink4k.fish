@@ -90,7 +90,7 @@ function shrink4k --description "Find and shrink oversized video files using vim
                 echo "  --list                Show files currently in the queue"
                 echo "  --done                Show files that have been processed"
                 echo "  --remove FILE         Remove a specific file from the queue"
-                echo "  --clear               Empty the queue"
+                echo "  --clear               Prompt to clear the queue, done list, both, or cancel"
                 echo "  --process             Process files from the queue one at a time"
                 echo ""
                 echo "Queue files (default): ~/.local/share/shrink4k/queue  and  .../done"
@@ -141,16 +141,37 @@ function shrink4k --description "Find and shrink oversized video files using vim
 
     # -------------------------------------------------------------------------
     if test "$do_clear" = true
-    # CLEAR MODE: empty the queue
+    # CLEAR MODE: prompt for what to clear (queue, done, both, or cancel)
     # -------------------------------------------------------------------------
 
-        if not test -s "$queue_file"
-            echo "Queue is already empty ($queue_file)"
-            return 0
+        set -l queue_total (count (grep -v '^[[:space:]]*$' "$queue_file" 2>/dev/null))
+        set -l done_total (count (grep -v '^[[:space:]]*$' "$done_file" 2>/dev/null))
+
+        echo "  Queue: $queue_total file(s) — $queue_file"
+        echo "  Done:  $done_total file(s) — $done_file"
+        echo ""
+
+        set -l choice ""
+        read -l -P "Clear which? [q]ueue / [d]one / [b]oth / [c]ancel: " choice
+
+        switch (string lower -- (string trim -- $choice))
+            case q queue
+                truncate -s 0 "$queue_file"
+                echo "Cleared $queue_total file(s) from queue ($queue_file)"
+            case d done
+                truncate -s 0 "$done_file"
+                echo "Cleared $done_total file(s) from done list ($done_file)"
+            case b both
+                truncate -s 0 "$queue_file"
+                truncate -s 0 "$done_file"
+                echo "Cleared $queue_total file(s) from queue and $done_total file(s) from done list"
+            case c cancel ''
+                echo "Cancelled — nothing cleared"
+                return 0
+            case '*'
+                echo "shrink4k: unrecognized choice: $choice — nothing cleared" >&2
+                return 1
         end
-        set -l total (count (grep -v '^[[:space:]]*$' "$queue_file" 2>/dev/null))
-        truncate -s 0 "$queue_file"
-        echo "Cleared $total file(s) from queue ($queue_file)"
 
     # -------------------------------------------------------------------------
     else if test -n "$remove_file"
